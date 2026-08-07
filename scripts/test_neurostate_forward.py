@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from models.neurostate3d import NeuroState3D
 from models.brainmvp_encoder import BrainMVPEncoder
+from models.modality_adapter import DEFAULT_ADAPTER_TYPES, MODALITY_ORDER
 
 
 class TinyMultiScaleEncoder(nn.Module):
@@ -41,7 +42,6 @@ def make_inputs(batch_size: int, size: int, device: str) -> dict[str, torch.Tens
         "fa": torch.randn(batch_size, 1, size, size, size, device=device),
         "md": torch.randn(batch_size, 1, size, size, size, device=device),
         "alff": torch.randn(batch_size, 1, size, size, size, device=device),
-        "reho": torch.randn(batch_size, 1, size, size, size, device=device),
     }
 
 
@@ -73,7 +73,7 @@ def main() -> None:
     parser.add_argument("--feature-stage", default="", type=str)
     args = parser.parse_args()
 
-    modalities = ["t1", "t2", "fa", "md", "alff", "reho"]
+    modalities = list(MODALITY_ORDER)
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested, but this PyTorch build cannot use CUDA.")
     base = make_inputs(args.batch_size, args.size, args.device)
@@ -94,14 +94,7 @@ def main() -> None:
         encoder=encoder,
         fusion_type=args.fusion,
         feature_stage=feature_stage,
-        adapter_types={
-            "t1": "identity",
-            "t2": "identity",
-            "fa": "residual_conv",
-            "md": "residual_conv",
-            "alff": "residual_conv",
-            "reho": "residual_conv",
-        },
+        adapter_types=DEFAULT_ADAPTER_TYPES,
     )
     model.to(args.device)
     model.eval()

@@ -8,3 +8,4 @@ pretrained/*
 *.bin
 __pycache__/
 *.pyc
+outputs/

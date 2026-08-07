@@ -71,6 +71,22 @@ python scripts/test_neurostate_forward.py --fusion mean --encoder tiny
 python scripts/test_neurostate_forward.py --fusion concat --encoder tiny
 ```
 
+Run the local engineering smoke suite with the official pretrained BrainMVP
+UniFormer and synthetic inputs only:
+
+```bash
+python scripts/smoke_test_local.py \
+  --checkpoint pretrained/BrainMVP_uniformer.pt \
+  --device cuda \
+  --tiny-size 16 \
+  --real-size 96
+```
+
+This writes `outputs/local_smoke_report.json`, which is intentionally ignored
+by git. The report records checkpoint coverage, synthetic missing-modality
+cases, mean/concat fusion behavior, NaN/Inf checks, gradient flow, one optimizer
+step, and real-size 96^3 forward status.
+
 Run the same forward contract with the official pretrained BrainMVP UniFormer:
 
 ```bash
@@ -140,6 +156,20 @@ at least 95%, no core encoder keys are missing or shape-mismatched, selected
 loaded tensors differ from random initialization, selected loaded tensors match
 the checkpoint tensors, the real 96^3 forward succeeds, and wrapper outputs are
 allclose with the official `SSLEncoder`.
+
+## Local Engineering Defaults
+
+Current local smoke modality order is centrally defined as:
+
+```text
+t1, t2, fa, md, alff
+```
+
+Default adapters are `identity` for `t1`/`t2` and `residual_conv` for
+`fa`/`md`/`alff`. The current config uses `stage4` as the selected fusion
+feature for this first engineering smoke. This is not a final research
+conclusion; future controlled experiments should compare `stage2`, `stage3`,
+and `stage4`.
 
 ## First Go/No-Go Boundary
 

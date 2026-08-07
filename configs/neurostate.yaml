@@ -11,7 +11,6 @@ modalities:
     - fa
     - md
     - alff
-    - reho
 
 adapter:
   enabled: true
@@ -22,7 +21,6 @@ adapter:
     fa: residual_conv
     md: residual_conv
     alff: residual_conv
-    reho: residual_conv
 
 fusion:
   type: mean

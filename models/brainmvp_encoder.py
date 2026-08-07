@@ -75,6 +75,7 @@ class BrainMVPEncoder(nn.Module):
             raise ValueError("input_layout must be 'bcdhw' or 'official'.")
         self.in_channels = in_channels
         self.input_layout = input_layout
+        self.freeze_mode = freeze
         self.last_load_report: Optional[CheckpointLoadReport] = None
 
         try:
@@ -100,6 +101,7 @@ class BrainMVPEncoder(nn.Module):
     def set_freeze_mode(self, mode: str) -> None:
         """Set trainability for the wrapped BrainMVP encoder."""
 
+        self.freeze_mode = mode
         if mode == "freeze_all":
             for param in self.encoder.parameters():
                 param.requires_grad = False
@@ -117,6 +119,12 @@ class BrainMVPEncoder(nn.Module):
             raise ValueError(
                 "freeze must be one of: freeze_all, unfreeze_last_stage, full_finetune"
             )
+
+    def train(self, mode: bool = True) -> "BrainMVPEncoder":
+        super().train(mode)
+        if mode and self.freeze_mode == "freeze_all":
+            self.encoder.eval()
+        return self
 
     def forward(self, x: torch.Tensor) -> FeatureDict:
         if x.ndim != 5:

@@ -6,7 +6,15 @@ import torch
 import torch.nn as nn
 
 
-SUPPORTED_MODALITIES = ("t1", "t2", "fa", "md", "alff", "reho")
+MODALITY_ORDER = ("t1", "t2", "fa", "md", "alff")
+DEFAULT_ADAPTER_TYPES = {
+    "t1": "identity",
+    "t2": "identity",
+    "fa": "residual_conv",
+    "md": "residual_conv",
+    "alff": "residual_conv",
+}
+SUPPORTED_MODALITIES = MODALITY_ORDER
 
 
 class IdentityAdapter(nn.Module):
