@@ -1,0 +1,63 @@
+backbone:
+  pretrained: false
+  checkpoint: ""
+  freeze: freeze_all
+  feature_stage: stage4
+
+modalities:
+  list:
+    - t1
+    - t2
+    - fa
+    - md
+    - alff
+    - reho
+
+adapter:
+  enabled: true
+  hidden_channels: 8
+  types:
+    t1: identity
+    t2: identity
+    fa: residual_conv
+    md: residual_conv
+    alff: residual_conv
+    reho: residual_conv
+
+fusion:
+  type: mean
+  hidden_dim: null
+  output_channels: null
+
+state:
+  channels: null
+
+teacher:
+  type: disabled
+  momentum: null
+
+diffusion:
+  enabled: false
+  architecture: null
+  timesteps: null
+  sampling_steps: null
+
+modality_dropout:
+  enabled: true
+  probability: 0.0
+  number_to_drop: null
+  fixed_keep: null
+  seed: 46
+
+loss:
+  rec_weight: 0.0
+  state_weight: 0.0
+  task_weight: 0.0
+  diffusion_weight: 0.0
+  observed_weight: 0.0
+
+training:
+  batch_size: 1
+  lr: 0.0003
+  epochs: 1
+  precision: fp32
