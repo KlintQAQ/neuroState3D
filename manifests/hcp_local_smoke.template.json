@@ -1,0 +1,13 @@
+{
+  "release": "HCP-YA-2025",
+  "data_root": "D:/NeuroStateData/HCP_YA_2025",
+  "subjects": [
+    {
+      "subject_id": "REPLACE_WITH_HCP_SUBJECT_ID",
+      "modalities": {
+        "t1": "raw/REPLACE_WITH_RELATIVE_T1W_NIFTI_PATH",
+        "t2": "raw/REPLACE_WITH_RELATIVE_T2W_NIFTI_PATH"
+      }
+    }
+  ]
+}

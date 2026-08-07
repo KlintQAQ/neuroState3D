@@ -171,6 +171,51 @@ feature for this first engineering smoke. This is not a final research
 conclusion; future controlled experiments should compare `stage2`, `stage3`,
 and `stage4`.
 
+## HCP Real-Data Smoke Preparation
+
+Real HCP images must stay outside this repository. The local target layout is:
+
+```text
+D:/NeuroStateData/HCP_YA_2025/
+  raw/
+  manifests/
+  processed/
+  cache/
+```
+
+Use `manifests/hcp_local_smoke.template.json` as the repo-side template. After
+authorized download, place the real local manifest at
+`D:/NeuroStateData/HCP_YA_2025/manifests/hcp_local_smoke.json`. It should store
+only `data_root` and relative T1/T2 paths, such as `raw/.../T1w.nii.gz`.
+HCP-YA 2025 data access requires the user to register/log in to BALSA, accept
+the HCP-YA 2025 Data Use Terms, choose 3 subjects, and download only the
+official structural T1w/T2w package/files.
+
+Inspect a populated subject manifest:
+
+```bash
+python scripts/inspect_hcp_subject.py \
+  --manifest D:/NeuroStateData/HCP_YA_2025/manifests/hcp_local_smoke.json \
+  --preprocess \
+  --roi-size 96 \
+  --output outputs/hcp_subject_inspection.json
+```
+
+Run real HCP T1/T2 smoke forward after official data have been downloaded:
+
+```bash
+python scripts/test_real_hcp.py \
+  --config configs/hcp.yaml \
+  --device cuda
+```
+
+The HCP preprocessing path follows the audited BrainMVP training intent:
+load NIfTI, channel-first, RAS orientation, 1 mm spacing, foreground crop,
+5-95 percentile intensity scaling to `[0,1]`, foreground crop again, then a
+96^3 patch plus padding. Official pretraining used random spatial crop samples;
+the real-data smoke uses a deterministic center crop so the engineering check
+is reproducible. It never resizes the whole brain directly to 96^3.
+
 ## First Go/No-Go Boundary
 
 Before implementing teacher learning or diffusion, compare:

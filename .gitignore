@@ -9,3 +9,10 @@ pretrained/*
 __pycache__/
 *.pyc
 outputs/
+data/
+raw/
+cache/
+*.nii
+*.nii.gz
+*.dcm
+*.dicom

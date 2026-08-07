@@ -1,0 +1,44 @@
+release: HCP-YA-2025
+data_root: D:/NeuroStateData/HCP_YA_2025
+raw_root: D:/NeuroStateData/HCP_YA_2025/raw
+manifest: D:/NeuroStateData/HCP_YA_2025/manifests/hcp_local_smoke.json
+repo_template_manifest: manifests/hcp_local_smoke.template.json
+target_subjects: 3
+modalities:
+  order:
+    - t1
+    - t2
+    - fa
+    - md
+    - alff
+  required_for_this_phase:
+    - t1
+    - t2
+preprocessing:
+  roi_size: 96
+  orientation: RAS
+  spacing_mm:
+    - 1.0
+    - 1.0
+    - 1.0
+  intensity:
+    method: ScaleIntensityRangePercentiles
+    lower: 5
+    upper: 95
+    b_min: 0.0
+    b_max: 1.0
+    clip: true
+  crop:
+    official_pretraining: random_spatial_crop_samples
+    real_smoke_default: deterministic_center_crop
+loader:
+  cache: false
+  batch_size: 1
+  num_workers: 0
+model:
+  checkpoint: pretrained/BrainMVP_uniformer.pt
+  fusion_stage: stage4
+  freeze_backbone: freeze_all
+outputs:
+  inspect_report: outputs/hcp_t1_t2_inspection.json
+  smoke_report: outputs/real_hcp_smoke_report.json
