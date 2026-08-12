@@ -12,6 +12,7 @@ outputs/
 data/
 raw/
 cache/
+tmp/
 *.nii
 *.nii.gz
 *.dcm
