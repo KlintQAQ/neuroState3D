@@ -36,9 +36,29 @@ teacher:
 
 diffusion:
   enabled: false
-  architecture: null
-  timesteps: null
-  sampling_steps: null
+  architecture: conditional_latent_3d
+  prediction: velocity
+  schedule: cosine
+  timesteps: 1000
+  sampler: ddim
+  sampling_steps: 50
+
+drifting:
+  enabled: false
+  architecture: conditional_latent_3d
+  samples_per_condition: 4
+  radii: [0.02, 0.05, 0.2]
+  sampling_steps: 1
+
+posterior:
+  enabled: false
+  methods:
+    - diffusion
+    - drifting
+  target: full_evidence_state_latent
+  condition: observed_evidence_state
+  require_frozen_teacher: true
+  require_deterministic_fusion_go: true
 
 modality_dropout:
   enabled: true

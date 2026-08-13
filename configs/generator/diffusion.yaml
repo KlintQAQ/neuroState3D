@@ -1,0 +1,24 @@
+method: diffusion
+role: robust_multi_step_reference
+space: full_evidence_state_latent
+condition: observed_evidence_state
+backbone:
+  latent_channels: 64
+  condition_channels: 64
+  hidden_channels: 96
+  depth: 6
+  num_modalities: 5
+  num_targets: 5
+  quality_channels: 0
+  embedding_dim: 192
+diffusion:
+  prediction: velocity
+  noise_schedule: cosine
+  timesteps: 1000
+  sampler: ddim
+  sampling_steps: 50
+  ddim_eta: 0.0
+  consistency_weight: 0.0
+evaluation:
+  samples_per_condition: 8
+  report: [fidelity, diversity, coverage, uncertainty_error_correlation, oece, hccr, nfe, latency_ms, peak_vram_mb]

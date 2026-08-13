@@ -5,7 +5,7 @@ framework while preserving official BrainMVP behavior. BrainMVP remains the
 pretrained visual prior; new modules live outside the official UniFormer and
 U-Net source files so official baselines can still be reproduced.
 
-This first round intentionally implements only:
+The deterministic first round implements:
 
 - `BrainMVPEncoder` wrapper for official multi-scale UniFormer features.
 - Lightweight modality adapters: `identity` and `residual_conv`.
@@ -14,8 +14,49 @@ This first round intentionally implements only:
 - Fixed-slot `concat` + Conv3D fusion baseline with mask conditioning.
 - `NeuroState3D` forward returning intermediate research artifacts.
 
-It does not implement diffusion, teacher learning, uncertainty estimation,
-BraTS clinical fine-tuning, or complex spatial evidence fusion.
+The repository now also contains two opt-in, parallel P7 posterior-engine
+implementations under `models/generators/`: conditional latent diffusion and
+conditional latent Drifting. They are disabled by default because the required
+full-evidence teacher target and P3 go/no-go evidence do not exist yet. Adding
+the code does not mean the scientific P7 comparison has passed.
+
+## Parallel Posterior Engines
+
+Both engines consume the same deterministic observed-evidence condition and
+return `[B, K, C, D, H, W]` posterior samples:
+
+```python
+from models.generators import PosteriorBackboneConfig, build_posterior_generator
+
+backbone = PosteriorBackboneConfig(
+    latent_channels=64,
+    condition_channels=64,
+)
+diffusion = build_posterior_generator("diffusion", backbone)
+drifting = build_posterior_generator("drifting", backbone)
+```
+
+- Diffusion is the robust reference: latent-space, cosine schedule,
+  v-prediction, and configurable-step DDIM sampling.
+- Drifting is the one-step candidate: a PyTorch port of the official drifting
+  field loss, adapted from class conditions to continuous 3D evidence
+  conditions.
+- Missing modalities remain mask metadata; neither generator inserts inferred
+  samples into the observed-evidence token path.
+- `NeuroState3D.sample_posterior(...)` can call either attached engine, but
+  posterior sampling is never run implicitly during deterministic fusion.
+
+Run the CPU/GPU engineering checks with:
+
+```bash
+python -m unittest tests.test_posterior_generators -v
+python scripts/smoke_posterior_generators.py --device cuda
+```
+
+The smoke timing is not a scientific comparison. Promotion of Drifting requires
+the same frozen teacher, split, latent, condition, parameter budget, and reports
+for fidelity, diversity, coverage, calibration, OECE/HCCR, NFE, latency, and
+peak VRAM.
 
 ## Shape Convention
 

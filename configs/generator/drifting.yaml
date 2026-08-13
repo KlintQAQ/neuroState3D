@@ -1,0 +1,23 @@
+method: drifting
+role: one_step_frontier_candidate
+space: full_evidence_state_latent
+condition: observed_evidence_state
+backbone:
+  latent_channels: 64
+  condition_channels: 64
+  hidden_channels: 96
+  depth: 6
+  num_modalities: 5
+  num_targets: 5
+  quality_channels: 0
+  embedding_dim: 192
+drifting:
+  samples_per_condition: 4
+  positive_copies: 1
+  radii: [0.02, 0.05, 0.2]
+  feature_grid: 4
+  consistency_weight: 0.0
+evaluation:
+  samples_per_condition: 8
+  report: [fidelity, diversity, coverage, uncertainty_error_correlation, oece, hccr, nfe, latency_ms, peak_vram_mb]
+promotion_rule: promote_only_if_calibration_and_coverage_match_diffusion_with_lower_latency

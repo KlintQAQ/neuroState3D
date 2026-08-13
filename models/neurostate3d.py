@@ -13,9 +13,9 @@ from models.multimodal_fusion import MeanFusion, build_fusion, stack_modalities
 class NeuroState3D(nn.Module):
     """First-round NeuroState-3D model.
 
-    This version intentionally stops at deterministic mask-aware feature
-    fusion. It does not implement teacher learning, diffusion, uncertainty, or
-    clinical downstream heads.
+    Deterministic fusion remains the default path. An optional posterior
+    generator can be attached behind ``brain_state`` without contaminating the
+    observed-evidence fusion path.
 
     Input:
         ``modalities``: mapping from modality name to ``[B, 1, D, H, W]`` tensor
@@ -41,6 +41,7 @@ class NeuroState3D(nn.Module):
         freeze_backbone: str = "freeze_all",
         fusion_channels: Optional[int] = None,
         fusion_hidden_channels: Optional[int] = None,
+        posterior_generator: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         if not modalities:
@@ -73,6 +74,7 @@ class NeuroState3D(nn.Module):
         self._fusion_channels = fusion_channels
         self._fusion_hidden_channels = fusion_hidden_channels
         self.fusion: Optional[nn.Module] = None
+        self.posterior_generator = posterior_generator
         if fusion_type == "mean":
             self.fusion = MeanFusion()
 
@@ -120,10 +122,42 @@ class NeuroState3D(nn.Module):
             "selected_features": selected_features,
             "fused_feature": fused_feature,
             "brain_state": fused_feature,
+            "posterior_condition": fused_feature,
             "fusion_weights": fusion_weights,
             "modality_mask": mask,
             "modalities": self.modalities,
         }
+
+    def sample_posterior(
+        self,
+        condition: torch.Tensor,
+        n_samples: int = 1,
+        seed: int = 0,
+        modality_mask: Optional[torch.Tensor] = None,
+        target_ids: Optional[torch.Tensor] = None,
+        quality: Optional[torch.Tensor] = None,
+        **sampling_kwargs: object,
+    ) -> torch.Tensor:
+        """Sample an attached Diffusion or Drifting posterior branch.
+
+        Sampling is explicit rather than part of ``forward`` so deterministic
+        evidence fusion remains reproducible and generator cost is opt-in.
+        """
+
+        if self.posterior_generator is None:
+            raise RuntimeError("No posterior_generator is attached to NeuroState3D.")
+        sample = getattr(self.posterior_generator, "sample", None)
+        if sample is None:
+            raise TypeError("posterior_generator must implement sample(...).")
+        return sample(
+            condition=condition,
+            n_samples=n_samples,
+            seed=seed,
+            modality_mask=modality_mask,
+            target_ids=target_ids,
+            quality=quality,
+            **sampling_kwargs,
+        )
 
     def _get_fusion(self, stacked_features: torch.Tensor) -> nn.Module:
         if self.fusion is not None:
