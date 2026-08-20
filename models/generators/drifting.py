@@ -12,6 +12,10 @@ from models.generators.common import (
     PosteriorBackboneConfig,
     repeat_batch,
 )
+from models.generators.evidence_constraints import (
+    contradiction_negative_weights,
+    nested_subset_consistency_loss,
+)
 
 
 @dataclass(frozen=True)
@@ -21,6 +25,12 @@ class DriftingConfig:
     radii: Sequence[float] = (0.02, 0.05, 0.2)
     feature_grid: int = 4
     consistency_weight: float = 0.0
+    contradiction_repulsion_strength: float = 0.0
+    contradiction_max_weight: float = 6.0
+    nested_identity_weight: float = 0.0
+    nested_contraction_weight: float = 0.0
+    nested_pool_size: int = 2
+    nested_contraction_margin: float = 0.0
 
 
 def _pairwise_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -146,8 +156,12 @@ class ConditionalLatentDrifting(nn.Module):
         target_ids: Optional[torch.Tensor] = None,
         quality: Optional[torch.Tensor] = None,
         negative_latents: Optional[torch.Tensor] = None,
+        negative_scores: Optional[torch.Tensor] = None,
         consistency_target: Optional[torch.Tensor] = None,
         consistency_mask: Optional[torch.Tensor] = None,
+        richer_condition: Optional[torch.Tensor] = None,
+        richer_modality_mask: Optional[torch.Tensor] = None,
+        richer_quality: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
     ) -> dict[str, torch.Tensor]:
         if target_latent.ndim != 5:
@@ -174,14 +188,34 @@ class ConditionalLatentDrifting(nn.Module):
         generated_features = self._features(generated)
         positive_features = self._features(positives)
         negative_features = None
+        negative_weights = None
         if negative_latents is not None:
             if negative_latents.ndim == 5:
                 negative_latents = negative_latents[:, None]
             negative_features = self._features(negative_latents)
+            if negative_scores is not None:
+                if self.config.contradiction_repulsion_strength <= 0:
+                    raise ValueError(
+                        "negative_scores require contradiction_repulsion_strength > 0"
+                    )
+                if negative_scores.ndim == 1:
+                    negative_scores = negative_scores[:, None]
+                if negative_scores.shape != negative_features.shape[:2]:
+                    raise ValueError(
+                        "negative_scores must match negative_latents [B,N]"
+                    )
+                negative_weights = contradiction_negative_weights(
+                    negative_scores,
+                    strength=self.config.contradiction_repulsion_strength,
+                    max_weight=self.config.contradiction_max_weight,
+                )
+        elif negative_scores is not None:
+            raise ValueError("negative_scores require negative_latents")
         native_loss, diagnostics = drifting_field_loss(
             generated_features,
             positive_features,
             negatives=negative_features,
+            negative_weights=negative_weights,
             radii=self.config.radii,
         )
         consistency_loss = target_latent.new_zeros(())
@@ -192,12 +226,69 @@ class ConditionalLatentDrifting(nn.Module):
                 consistency_loss = (difference * mask).sum() / mask.sum().clamp_min(1)
             else:
                 consistency_loss = difference.mean()
-        loss = native_loss + self.config.consistency_weight * consistency_loss
+
+        nested_identity_loss = target_latent.new_zeros(())
+        nested_contraction_loss = target_latent.new_zeros(())
+        nested_diagnostics: dict[str, torch.Tensor] = {}
+        nested_enabled = (
+            self.config.nested_identity_weight > 0
+            or self.config.nested_contraction_weight > 0
+        )
+        if nested_enabled:
+            if richer_condition is None or richer_modality_mask is None:
+                raise ValueError(
+                    "Nested-subset losses require richer_condition and "
+                    "richer_modality_mask"
+                )
+            if modality_mask is None:
+                raise ValueError("Nested-subset losses require modality_mask")
+            richer_generated = self.model(
+                noise,
+                repeat_batch(richer_condition, generated_count),
+                time=noise.new_zeros((noise.shape[0],)),
+                modality_mask=repeat_batch(richer_modality_mask, generated_count),
+                target_ids=repeat_batch(target_ids, generated_count),
+                quality=repeat_batch(richer_quality, generated_count),
+            ).reshape(batch_size, generated_count, *target_latent.shape[1:])
+            (
+                nested_identity_loss,
+                nested_contraction_loss,
+                nested_diagnostics,
+            ) = nested_subset_consistency_loss(
+                generated,
+                richer_generated,
+                modality_mask,
+                richer_modality_mask,
+                pool_size=self.config.nested_pool_size,
+                contraction_margin=self.config.nested_contraction_margin,
+            )
+        elif richer_condition is not None or richer_modality_mask is not None:
+            raise ValueError(
+                "richer_condition/mask were provided but nested losses are disabled"
+            )
+
+        loss = (
+            native_loss
+            + self.config.consistency_weight * consistency_loss
+            + self.config.nested_identity_weight * nested_identity_loss
+            + self.config.nested_contraction_weight * nested_contraction_loss
+        )
         return {
             "loss": loss,
             "native_loss": native_loss.detach(),
             "consistency_loss": consistency_loss.detach(),
+            "nested_identity_loss": nested_identity_loss.detach(),
+            "nested_contraction_loss": nested_contraction_loss.detach(),
+            "contradiction_weight_mean": (
+                negative_weights.mean().detach()
+                if negative_weights is not None
+                else target_latent.new_ones(())
+            ),
             "generated": generated,
+            **{
+                f"nested_{key}": value
+                for key, value in nested_diagnostics.items()
+            },
             **{f"drift_{key}": value for key, value in diagnostics.items()},
         }
 

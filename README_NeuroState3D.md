@@ -58,6 +58,31 @@ the same frozen teacher, split, latent, condition, parameter budget, and reports
 for fidelity, diversity, coverage, calibration, OECE/HCCR, NFE, latency, and
 peak VRAM.
 
+### Drifting innovation ablations
+
+Two optional objectives are disabled by default and can be tested separately:
+
+- `contradiction`: target-keyed hard negatives receive stronger Drifting
+  repulsion when they confidently contradict observed evidence.
+- `nested`: for the same subject and noise, a richer observed-modality subset
+  teaches low-frequency identity while its posterior variance is constrained
+  not to increase.
+
+Run either objective or their combination:
+
+```bash
+python scripts/smoke_drifting_innovations.py --method contradiction --device cuda
+python scripts/smoke_drifting_innovations.py --method nested --device cuda
+python scripts/smoke_drifting_innovations.py --method both --device cuda
+```
+
+The corresponding frozen experiment configurations are
+`configs/generator/drifting_contradiction.yaml`,
+`configs/generator/drifting_nested_subset.yaml`, and
+`configs/generator/drifting_combined.yaml`. These smoke runs validate code
+paths only; efficacy requires real paired full/partial subjects and downstream
+missing-modality metrics.
+
 ## Shape Convention
 
 NeuroState-3D external modules use:
