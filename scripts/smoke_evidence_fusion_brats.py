@@ -66,6 +66,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-channels", type=int, default=512)
     parser.add_argument("--encoder-freeze", default="freeze_all")
     parser.add_argument("--degrade-prob", type=float, default=0.25)
+    parser.add_argument("--foreground-crop-prob", type=float, default=0.8)
+    parser.add_argument("--crop-mode", default="region_balanced")
     parser.add_argument("--seed", type=int, default=46)
     parser.add_argument(
         "--report-path",
@@ -246,6 +248,8 @@ def main() -> int:
         max_subjects=args.max_subjects,
         modality_mask_mode="random_nonempty",
         degrade_prob=args.degrade_prob,
+        foreground_crop_prob=args.foreground_crop_prob,
+        crop_mode=args.crop_mode,
         seed=args.seed,
     )
     loader = DataLoader(
@@ -315,6 +319,8 @@ def main() -> int:
             "hidden_channels": args.hidden_channels,
             "encoder_freeze": args.encoder_freeze,
             "degrade_prob": args.degrade_prob,
+            "foreground_crop_prob": args.foreground_crop_prob,
+            "crop_mode": args.crop_mode,
         },
         "subjects_in_dataset": len(dataset),
         "modalities": list(BRATS_MODALITIES),

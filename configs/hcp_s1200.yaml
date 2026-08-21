@@ -1,0 +1,189 @@
+release: HCP-S1200
+data_root: E:/NeuroState3D_Data
+bucket: hcp-openaccess
+release_prefix: HCP_1200
+unsigned: false
+aws_profile: ""
+region: us-east-1
+
+layout:
+  raw: raw/HCP_S1200
+  derived: derived/HCP_S1200
+  processed: processed/HCP_S1200
+  model_ready: model_ready/HCP_S1200
+  qc: qc
+  manifests: manifests
+
+safety:
+  forbidden_drives:
+    - C
+  forbid_repo_data: true
+  required_free_space_multiplier: 1.5
+
+audit:
+  min_valid_rest_runs_relaxed: 1
+  write_eligible_subjects_as: strict
+  max_workers: 16
+  output_all_subjects: hcp_s1200_all_subjects.csv
+  output_eligible_subjects: hcp_s1200_eligible_subjects.txt
+  output_strict_subjects: hcp_s1200_eligible_strict.txt
+  output_relaxed_subjects: hcp_s1200_eligible_relaxed.txt
+  output_summary_json: hcp_s1200_audit_summary.json
+
+downloads:
+  default_cohort: strict
+  runs_dir: downloads
+  manifest_csv: hcp_download_manifest.csv
+  subject_status_csv: hcp_subject_status.csv
+  completed_subjects: download_completed_subjects.txt
+  failed_subjects: download_failed_subjects.txt
+  max_parallel_downloads: 1
+  max_parallel_preprocessing: 1
+  size_probe_workers: 4
+  size_probe_retry_count: 8
+  retry_count: 12
+  chunk_size_mb: 8
+
+batches:
+  batch_size_subjects: 30
+  output_dir: batches
+  plan_csv: hcp_s1200_batch_plan.csv
+  status_csv: hcp_s1200_batch_status.csv
+  data_layout_readme: README_NEUROSTATE3D_DATA_LAYOUT.md
+  delete_raw_only_after_model_ready_pass: true
+
+modalities:
+  model_order:
+    - T1
+    - T2
+    - FA
+    - MD
+    - ALFF
+  acquisition_dependencies:
+    T1: T1
+    T2: T2
+    FA: DWI
+    MD: DWI
+    ALFF: rs-fMRI
+
+remote_files:
+  structural:
+    t1:
+      purpose: T1w anatomical source in MNINonLinear space
+      candidates:
+        - "{release_prefix}/{subject_id}/MNINonLinear/T1w_restore.nii.gz"
+        - "{release_prefix}/{subject_id}/T1w/T1w_acpc_dc_restore.nii.gz"
+        - "{release_prefix}/{subject_id}/T1w/T1w_acpc_dc_restore_1.25.nii.gz"
+    t2:
+      purpose: T2w anatomical source in MNINonLinear space
+      candidates:
+        - "{release_prefix}/{subject_id}/MNINonLinear/T2w_restore.nii.gz"
+        - "{release_prefix}/{subject_id}/T1w/T2w_acpc_dc_restore.nii.gz"
+        - "{release_prefix}/{subject_id}/T1w/T2w_acpc_dc_restore_1.25.nii.gz"
+    brainmask:
+      purpose: structural brain mask in MNINonLinear space
+      optional: true
+      candidates:
+        - "{release_prefix}/{subject_id}/MNINonLinear/brainmask_fs.nii.gz"
+        - "{release_prefix}/{subject_id}/T1w/brainmask_fs.nii.gz"
+        - "{release_prefix}/{subject_id}/T1w/T1w_acpc_dc_restore_brain.nii.gz"
+    t1_acpc_reference:
+      purpose: T1w ACPC reference for DWI transform provenance
+      optional: true
+      candidates:
+        - "{release_prefix}/{subject_id}/T1w/T1w_acpc_dc_restore.nii.gz"
+    t2_acpc_reference:
+      purpose: T2w ACPC reference for provenance
+      optional: true
+      candidates:
+        - "{release_prefix}/{subject_id}/T1w/T2w_acpc_dc_restore.nii.gz"
+    acpc_to_standard_warp:
+      purpose: ACPC to standard-space nonlinear transform
+      optional: true
+      candidates:
+        - "{release_prefix}/{subject_id}/MNINonLinear/xfms/acpc_dc2standard.nii.gz"
+    standard_to_acpc_warp:
+      purpose: standard-space to ACPC nonlinear transform
+      optional: true
+      candidates:
+        - "{release_prefix}/{subject_id}/MNINonLinear/xfms/standard2acpc_dc.nii.gz"
+  diffusion:
+    dwi:
+      purpose: preprocessed diffusion MRI
+      candidates:
+        - "{release_prefix}/{subject_id}/T1w/Diffusion/data.nii.gz"
+    bval:
+      purpose: DWI b-values
+      candidates:
+        - "{release_prefix}/{subject_id}/T1w/Diffusion/bvals"
+    bvec:
+      purpose: DWI b-vectors
+      candidates:
+        - "{release_prefix}/{subject_id}/T1w/Diffusion/bvecs"
+    nodif_brain_mask:
+      purpose: DWI brain mask
+      optional: true
+      candidates:
+        - "{release_prefix}/{subject_id}/T1w/Diffusion/nodif_brain_mask.nii.gz"
+    grad_dev:
+      purpose: gradient deviation field
+      optional: true
+      candidates:
+        - "{release_prefix}/{subject_id}/T1w/Diffusion/grad_dev.nii.gz"
+  resting_fmri:
+    REST1_LR:
+      purpose: REST1 LR volumetric BOLD
+      candidates:
+        - "{release_prefix}/{subject_id}/MNINonLinear/Results/rfMRI_REST1_LR/rfMRI_REST1_LR_hp2000_clean.nii.gz"
+        - "{release_prefix}/{subject_id}/MNINonLinear/Results/rfMRI_REST1_LR/rfMRI_REST1_LR.nii.gz"
+    REST1_RL:
+      purpose: REST1 RL volumetric BOLD
+      candidates:
+        - "{release_prefix}/{subject_id}/MNINonLinear/Results/rfMRI_REST1_RL/rfMRI_REST1_RL_hp2000_clean.nii.gz"
+        - "{release_prefix}/{subject_id}/MNINonLinear/Results/rfMRI_REST1_RL/rfMRI_REST1_RL.nii.gz"
+    REST2_LR:
+      purpose: REST2 LR volumetric BOLD
+      candidates:
+        - "{release_prefix}/{subject_id}/MNINonLinear/Results/rfMRI_REST2_LR/rfMRI_REST2_LR_hp2000_clean.nii.gz"
+        - "{release_prefix}/{subject_id}/MNINonLinear/Results/rfMRI_REST2_LR/rfMRI_REST2_LR.nii.gz"
+    REST2_RL:
+      purpose: REST2 RL volumetric BOLD
+      candidates:
+        - "{release_prefix}/{subject_id}/MNINonLinear/Results/rfMRI_REST2_RL/rfMRI_REST2_RL_hp2000_clean.nii.gz"
+        - "{release_prefix}/{subject_id}/MNINonLinear/Results/rfMRI_REST2_RL/rfMRI_REST2_RL.nii.gz"
+
+post_download_validation:
+  diffusion:
+    require_dwi_bval_bvec_count_match: true
+    tensor_fit_pipeline: PENDING
+    output_native:
+      - FA_native.nii.gz
+      - MD_native.nii.gz
+  resting_fmri:
+    require_true_bold_timeseries: true
+    alff_per_run_outputs:
+      - ALFF_REST1_LR.nii.gz
+      - ALFF_REST1_RL.nii.gz
+      - ALFF_REST2_LR.nii.gz
+      - ALFF_REST2_RL.nii.gz
+    final_output: ALFF_final.nii.gz
+  final_processed_outputs:
+    - T1.nii.gz
+    - T2.nii.gz
+    - FA.nii.gz
+    - MD.nii.gz
+    - ALFF.nii.gz
+  model_ready_outputs:
+    - T1.npy
+    - T2.npy
+    - FA.npy
+    - MD.npy
+    - ALFF.npy
+    - multimodal_5ch.npy
+
+split:
+  train: 0.7
+  val: 0.1
+  test: 0.2
+  seed: 20260810
+  family_aware_if_legal_metadata_available: true

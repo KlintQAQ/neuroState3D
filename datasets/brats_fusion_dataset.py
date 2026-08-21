@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import random
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -58,6 +58,9 @@ class BraTSFusionDataset(Dataset):
         modality_mask_mode: str = "all",
         fixed_modalities: Sequence[str] | None = None,
         degrade_prob: float = 0.0,
+        foreground_crop_prob: float = 0.0,
+        crop_mode: str = "foreground",
+        region_crop_weights: Mapping[str, float] | None = None,
         seed: int = 46,
     ) -> None:
         self.manifest_csv = Path(manifest_csv)
@@ -69,6 +72,17 @@ class BraTSFusionDataset(Dataset):
             else None
         )
         self.degrade_prob = float(degrade_prob)
+        self.foreground_crop_prob = float(foreground_crop_prob)
+        self.crop_mode = crop_mode
+        self.region_crop_weights = dict(
+            region_crop_weights
+            or {
+                "ET": 0.45,
+                "TC": 0.30,
+                "WT": 0.20,
+                "foreground": 0.05,
+            }
+        )
         self.seed = int(seed)
         self.epoch = 0
 
@@ -94,10 +108,24 @@ class BraTSFusionDataset(Dataset):
             np.load(row["multimodal_path"]).astype(np.float32, copy=True)
         )
         seg = torch.from_numpy(np.load(row["seg_path"]).astype(np.int64, copy=True))
+        rng = random.Random(self.seed + self.epoch * 100_003 + index * 9176)
 
         if image.shape[0] != len(BRATS_MODALITIES):
             raise ValueError(
                 f"Expected {len(BRATS_MODALITIES)} modalities, got {tuple(image.shape)}"
+            )
+        if (
+            self.spatial_size is not None
+            and self.foreground_crop_prob > 0
+            and rng.random() < self.foreground_crop_prob
+        ):
+            image, seg = self._region_crop(
+                image,
+                seg,
+                self.spatial_size,
+                rng,
+                self.crop_mode,
+                self.region_crop_weights,
             )
         if self.spatial_size is not None:
             image = F.interpolate(
@@ -116,7 +144,6 @@ class BraTSFusionDataset(Dataset):
         modality_state = torch.zeros(len(BRATS_MODALITIES), dtype=torch.long)
         modality_state[mask <= 0] = 1
 
-        rng = random.Random(self.seed + self.epoch * 100_003 + index * 9176)
         if self.degrade_prob > 0:
             for modality_index in range(len(BRATS_MODALITIES)):
                 if mask[modality_index] <= 0:
@@ -186,6 +213,86 @@ class BraTSFusionDataset(Dataset):
                 padding=1,
             ).squeeze(0).squeeze(0)
         return degraded
+
+    @staticmethod
+    def _region_crop(
+        image: torch.Tensor,
+        seg: torch.Tensor,
+        crop_size: tuple[int, int, int],
+        rng: random.Random,
+        crop_mode: str = "foreground",
+        region_crop_weights: Mapping[str, float] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        spatial = tuple(int(item) for item in seg.shape)
+        if any(crop_size[axis] >= spatial[axis] for axis in range(3)):
+            return image, seg
+        foreground = BraTSFusionDataset._crop_candidates(
+            seg,
+            crop_mode,
+            region_crop_weights,
+            rng,
+        )
+        if foreground.numel() == 0:
+            return image, seg
+        center_index = rng.randrange(foreground.shape[0])
+        center = foreground[center_index].tolist()
+        slices = []
+        for axis, size in enumerate(crop_size):
+            half = size // 2
+            low = int(center[axis]) - half
+            high = low + size
+            if low < 0:
+                low = 0
+                high = size
+            if high > spatial[axis]:
+                high = spatial[axis]
+                low = high - size
+            slices.append(slice(low, high))
+        cropped_image = image[:, slices[0], slices[1], slices[2]]
+        cropped_seg = seg[slices[0], slices[1], slices[2]]
+        return cropped_image, cropped_seg
+
+    @staticmethod
+    def _crop_candidates(
+        seg: torch.Tensor,
+        crop_mode: str,
+        region_crop_weights: Mapping[str, float] | None,
+        rng: random.Random,
+    ) -> torch.Tensor:
+        if crop_mode == "foreground":
+            return torch.nonzero(seg > 0, as_tuple=False)
+        if crop_mode != "region_balanced":
+            raise ValueError("crop_mode must be one of: foreground, region_balanced")
+        weights = region_crop_weights or {}
+        choices = [
+            ("ET", max(float(weights.get("ET", 0.0)), 0.0)),
+            ("TC", max(float(weights.get("TC", 0.0)), 0.0)),
+            ("WT", max(float(weights.get("WT", 0.0)), 0.0)),
+            ("foreground", max(float(weights.get("foreground", 0.0)), 0.0)),
+        ]
+        total = sum(weight for _, weight in choices)
+        if total <= 0:
+            choices = [("ET", 0.45), ("TC", 0.30), ("WT", 0.20), ("foreground", 0.05)]
+            total = 1.0
+        draw = rng.random() * total
+        cumulative = 0.0
+        selected = "foreground"
+        for name, weight in choices:
+            cumulative += weight
+            if draw <= cumulative:
+                selected = name
+                break
+        region_masks = {
+            "ET": seg == 3,
+            "TC": (seg == 1) | (seg == 3),
+            "WT": seg > 0,
+            "foreground": seg > 0,
+        }
+        for name in [selected, "ET", "TC", "WT", "foreground"]:
+            candidates = torch.nonzero(region_masks[name], as_tuple=False)
+            if candidates.numel() > 0:
+                return candidates
+        return torch.empty((0, 3), dtype=torch.long)
 
     @staticmethod
     def _read_rows(path: Path) -> list[dict[str, str]]:

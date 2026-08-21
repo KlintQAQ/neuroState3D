@@ -10,18 +10,79 @@ def multilabel_dice_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
     smooth: float = 1.0,
+    region_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     probs = torch.sigmoid(logits)
     dims = tuple(range(2, probs.ndim))
     intersection = (probs * target).sum(dim=dims)
     denom = probs.pow(2).sum(dim=dims) + target.pow(2).sum(dim=dims)
     dice = (2 * intersection + smooth) / (denom + smooth)
-    return 1.0 - dice.mean()
+    loss = 1.0 - dice
+    if region_weights is not None:
+        weights = region_weights.to(device=logits.device, dtype=logits.dtype)
+        weights = weights.view(1, -1)
+        return (loss * weights).sum() / weights.sum().clamp_min(1e-8)
+    return loss.mean()
 
 
-def segmentation_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    return multilabel_dice_loss(logits, target) + F.binary_cross_entropy_with_logits(
-        logits, target
+def focal_bce_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 0.75,
+    gamma: float = 2.0,
+    region_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    probs = torch.sigmoid(logits)
+    p_t = probs * target + (1.0 - probs) * (1.0 - target)
+    alpha_t = alpha * target + (1.0 - alpha) * (1.0 - target)
+    loss = alpha_t * (1.0 - p_t).pow(gamma) * bce
+    if region_weights is not None:
+        weights = region_weights.to(device=logits.device, dtype=logits.dtype)
+        view_shape = (1, -1) + (1,) * (logits.ndim - 2)
+        loss = loss * weights.view(view_shape)
+        return loss.sum() / weights.sum().clamp_min(1e-8) / loss.shape[0] / loss[0, 0].numel()
+    return loss.mean()
+
+
+def tversky_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 0.3,
+    beta: float = 0.7,
+    smooth: float = 1.0,
+    region_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    dims = tuple(range(2, probs.ndim))
+    tp = (probs * target).sum(dim=dims)
+    fp = (probs * (1.0 - target)).sum(dim=dims)
+    fn = ((1.0 - probs) * target).sum(dim=dims)
+    score = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+    loss = 1.0 - score
+    if region_weights is not None:
+        weights = region_weights.to(device=logits.device, dtype=logits.dtype)
+        weights = weights.view(1, -1)
+        return (loss * weights).sum() / weights.sum().clamp_min(1e-8)
+    return loss.mean()
+
+
+def segmentation_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    region_weights: Sequence[float] | torch.Tensor | None = (2.0, 1.5, 1.0),
+) -> torch.Tensor:
+    weights = None
+    if region_weights is not None:
+        weights = (
+            region_weights
+            if torch.is_tensor(region_weights)
+            else torch.tensor(region_weights, dtype=logits.dtype, device=logits.device)
+        )
+    return (
+        multilabel_dice_loss(logits, target, region_weights=weights)
+        + focal_bce_loss(logits, target, region_weights=weights)
+        + 0.5 * tversky_loss(logits, target, region_weights=weights)
     )
 
 
@@ -112,8 +173,6 @@ def mean_gate_by_region(
     """Average class-conditioned gate values over the spatial grid."""
 
     with torch.no_grad():
-        valid = modality_mask.view(modality_mask.shape[0], 1, -1, 1, 1, 1)
-        gates = gates * valid
         values = gates.mean(dim=(0, 3, 4, 5))
         result: dict[str, float] = {}
         for region_index, region in enumerate(region_names):

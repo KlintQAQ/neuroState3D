@@ -216,6 +216,71 @@ load NIfTI, channel-first, RAS orientation, 1 mm spacing, foreground crop,
 the real-data smoke uses a deterministic center crop so the engineering check
 is reproducible. It never resizes the whole brain directly to 96^3.
 
+## HCP S1200 Full-Cohort Data Strategy
+
+The full-data phase now targets all HCP S1200 subjects that can support the
+five model-ready maps:
+
+```text
+T1, T2, FA, MD, ALFF
+```
+
+The corresponding acquisition dependencies are preserved:
+
+```text
+T1 -> T1w
+T2 -> T2w
+FA + MD -> diffusion MRI + bvals/bvecs
+ALFF -> resting-state fMRI BOLD
+```
+
+Data must be written under `E:/NeuroState3D_Data`, never to `C:` and never
+inside this git repository. The first phase only audits S3 object existence and
+sizes; it does not download data:
+
+```bash
+aws configure --profile hcp
+python scripts/hcp_s1200_audit.py --config configs/hcp_s1200.yaml --profile hcp
+```
+
+This writes:
+
+```text
+E:/NeuroState3D_Data/manifests/hcp_s1200_all_subjects.csv
+E:/NeuroState3D_Data/manifests/hcp_s1200_eligible_subjects.txt
+E:/NeuroState3D_Data/manifests/hcp_s1200_eligible_strict.txt
+E:/NeuroState3D_Data/manifests/hcp_s1200_eligible_relaxed.txt
+E:/NeuroState3D_Data/manifests/hcp_s1200_audit_summary.json
+```
+
+`strict` requires T1, T2, DWI, bvals, bvecs, and all four HCP resting runs
+(`REST1_LR`, `REST1_RL`, `REST2_LR`, `REST2_RL`). `relaxed` requires T1, T2,
+DWI, bvals, bvecs, and at least one usable resting run. The main dataset
+defaults to strict unless it is clearly too small.
+
+Build the strict download plan without downloading:
+
+```bash
+python scripts/hcp_s1200_download.py --config configs/hcp_s1200.yaml --profile hcp
+```
+
+After checking the manifest and E: drive space, execute the resumable download:
+
+```bash
+python scripts/hcp_s1200_download.py --config configs/hcp_s1200.yaml --profile hcp --execute
+```
+
+The downloader is idempotent, skips completed files by size, resumes `.part`
+files with S3 range requests, records per-subject failures, and does not let one
+failed subject terminate the whole batch. It downloads only structural T1/T2,
+preprocessed DWI with bvals/bvecs, and resting fMRI runs needed for ALFF. Task
+fMRI, MEG, 7T, behavioral data, task contrasts, unrelated FreeSurfer outputs,
+and unrelated surface files are not part of the plan.
+
+This stage still does not implement Fusion. After download, FA/MD derivation,
+ALFF derivation, registration, QC, model-ready conversion, and split generation
+must complete before any Fusion benchmark starts.
+
 ## First Go/No-Go Boundary
 
 Before implementing teacher learning or diffusion, compare:

@@ -10,9 +10,13 @@ __pycache__/
 *.pyc
 outputs/
 data/
+reports/
 raw/
 cache/
 tmp/
+.venv*/
+logs/
+*.log
 *.nii
 *.nii.gz
 *.dcm
