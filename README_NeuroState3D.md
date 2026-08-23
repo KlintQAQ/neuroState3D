@@ -14,11 +14,11 @@ The deterministic first round implements:
 - Fixed-slot `concat` + Conv3D fusion baseline with mask conditioning.
 - `NeuroState3D` forward returning intermediate research artifacts.
 
-The repository now also contains two opt-in, parallel P7 posterior-engine
-implementations under `models/generators/`: conditional latent diffusion and
-conditional latent Drifting. They are disabled by default because the required
-full-evidence teacher target and P3 go/no-go evidence do not exist yet. Adding
-the code does not mean the scientific P7 comparison has passed.
+The repository also contains two opt-in, parallel posterior engines under
+`models/generators/`: conditional latent diffusion and conditional latent
+Drifting. A separate end-to-end Drifting path now decodes missing-modality
+latents to MRI slots and sends the completed volume to evidence fusion. The
+default deterministic path remains unchanged.
 
 ## Parallel Posterior Engines
 
@@ -41,8 +41,9 @@ drifting = build_posterior_generator("drifting", backbone)
 - Drifting is the one-step candidate: a PyTorch port of the official drifting
   field loss, adapted from class conditions to continuous 3D evidence
   conditions.
-- Missing modalities remain mask metadata; neither generator inserts inferred
-  samples into the observed-evidence token path.
+- The standalone posterior engines keep missing modalities as mask metadata.
+  `DriftingImputationFusion` is the explicit opt-in path that decodes and
+  inserts generated MRI before the final fusion pass.
 - `NeuroState3D.sample_posterior(...)` can call either attached engine, but
   posterior sampling is never run implicitly during deterministic fusion.
 
@@ -58,30 +59,60 @@ the same frozen teacher, split, latent, condition, parameter budget, and reports
 for fidelity, diversity, coverage, calibration, OECE/HCCR, NFE, latency, and
 peak VRAM.
 
-### Drifting innovation ablations
+### End-to-end Drifting imputation and fusion
 
-Two optional objectives are disabled by default and can be tested separately:
+`models/drifting_imputation_fusion.py` implements the complete execution path:
 
-- `contradiction`: target-keyed hard negatives receive stronger Drifting
-  repulsion when they confidently contradict observed evidence.
-- `nested`: for the same subject and noise, a richer observed-modality subset
-  teaches low-frequency identity while its posterior variance is constrained
-  not to increase.
-
-Run either objective or their combination:
-
-```bash
-python scripts/smoke_drifting_innovations.py --method contradiction --device cuda
-python scripts/smoke_drifting_innovations.py --method nested --device cuda
-python scripts/smoke_drifting_innovations.py --method both --device cuda
+```text
+observed MRI -> preliminary fusion condition -> Drifting latent samples
+             -> high-resolution context residual MRI decoder
+             -> uncertainty-weighted fusion
+             -> BraTS segmentation logits
 ```
 
-The corresponding frozen experiment configurations are
-`configs/generator/drifting_contradiction.yaml`,
-`configs/generator/drifting_nested_subset.yaml`, and
-`configs/generator/drifting_combined.yaml`. These smoke runs validate code
-paths only; efficacy requires real paired full/partial subjects and downstream
-missing-modality metrics.
+Masked MRI slots retained by `BraTSFusionDataset` are used only as targets when
+`compute_generator_loss=True`. During inference those slots may be zero because
+the generated images overwrite them before final fusion. Generated modalities
+use state ID `3`. Confidence combines decoded-sample disagreement with a
+voxel-wise error scale trained by NLL and calibration objectives. The resulting
+spatial confidence map is resized at each fusion feature stage, so unreliable
+local regions can be down-weighted without suppressing the whole generated
+modality. The confidence prior is detached before fusion so task loss cannot
+obtain a better gate simply by claiming unjustified certainty.
+
+Training is intentionally staged. First, the same fusion network is warmed up
+on both full-real and masked inputs. It is then frozen by default while the
+Drifting generator and MRI decoders are trained. Validation uses a disjoint
+subject split and reports `full_real`, `missing`, `drifting_filled`, and the
+filled-vs-missing Dice delta using that same frozen fusion network.
+
+Train the integrated model (the default fixed example holds out T1c):
+
+```bash
+python scripts/train_drifting_imputation_fusion.py \
+  --manifest data/manifests/BraTS2023_HF/brats_model_ready_processed.csv \
+  --checkpoint pretrained/BrainMVP_uniformer.pt \
+  --mask-mode fixed \
+  --fixed-modalities t1n t2w t2f \
+  --fusion-warmup-epochs 1 \
+  --epochs 1 \
+  --val-fraction 0.2 \
+  --device cuda
+```
+
+Run inference from the resulting checkpoint:
+
+```bash
+python scripts/infer_drifting_imputation_fusion.py \
+  --model outputs/drifting_imputation_fusion.pt \
+  --manifest data/manifests/BraTS2023_HF/brats_model_ready_processed.csv \
+  --observed-modalities t1n t2w t2f \
+  --device cuda
+```
+
+The reference settings are frozen in
+`configs/drifting_imputation_fusion.yaml`. Run the lightweight contract test
+with `python -m unittest tests.test_drifting_imputation_fusion -v`.
 
 ## Shape Convention
 

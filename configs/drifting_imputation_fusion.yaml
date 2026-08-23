@@ -1,0 +1,33 @@
+modalities: [t1n, t1c, t2w, t2f]
+fusion:
+  feature_stage: stage4
+  feature_channels: 512
+  hidden_channels: 64
+  encoder_freeze: freeze_all
+drifting:
+  latent_channels: 512
+  condition_channels: 512
+  hidden_channels: 96
+  depth: 4
+  samples_per_condition: 4
+  radii: [0.02, 0.05, 0.2]
+  feature_grid: 4
+imputation:
+  samples_per_target: 4
+  decoder_hidden_channels: 64
+  decoder_highres_channels: 16
+  decoder_residual_scale: 1.0
+  drift_loss_weight: 1.0
+  reconstruction_weight: 1.0
+  uncertainty_nll_weight: 0.05
+  uncertainty_calibration_weight: 0.05
+  uncertainty_scale: 1.0
+  minimum_generated_confidence: 0.05
+  maximum_generated_confidence: 0.95
+training:
+  mask_mode: random_nonempty
+  fusion_warmup_epochs: 1
+  freeze_fusion_during_generator: true
+  val_fraction: 0.2
+  segmentation_weight: 1.0
+  generator_weight: 1.0

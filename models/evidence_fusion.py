@@ -80,7 +80,10 @@ class EvidenceReliableFusion(nn.Module):
     Input tensors:
         images: [B, M, D, H, W]
         modality_mask: [B, M] where 1 means observed and 0 means missing
-        modality_state: [B, M] with 0 present, 1 missing, 2 degraded
+        modality_state: [B, M] with 0 present, 1 missing, 2 degraded,
+            and 3 generated/imputed
+        modality_confidence: optional [B, M] or [B, M, D, H, W]
+            reliability prior in [0, 1]
 
     Outputs:
         logits: [B, K, D, H, W] for ET/TC/WT
@@ -88,7 +91,11 @@ class EvidenceReliableFusion(nn.Module):
         gates: [B, K, M, d, h, w], class-conditioned modality weights
     """
 
-    def __init__(self, config: EvidenceFusionConfig) -> None:
+    def __init__(
+        self,
+        config: EvidenceFusionConfig,
+        encoder: nn.Module | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.modalities = [name.lower() for name in config.modalities]
@@ -97,7 +104,7 @@ class EvidenceReliableFusion(nn.Module):
         self.num_regions = len(self.regions)
         self.feature_stage = config.feature_stage
 
-        self.encoder = BrainMVPEncoder(
+        self.encoder = encoder or BrainMVPEncoder(
             in_channels=1,
             checkpoint_path=config.checkpoint_path,
             freeze=config.encoder_freeze,
@@ -106,7 +113,8 @@ class EvidenceReliableFusion(nn.Module):
         self.modality_embedding = nn.Embedding(
             self.num_modalities, config.state_embedding_dim
         )
-        self.state_embedding = nn.Embedding(3, config.state_embedding_dim)
+        # 0 present, 1 missing, 2 degraded, 3 generated/imputed.
+        self.state_embedding = nn.Embedding(4, config.state_embedding_dim)
         adapter_in = config.feature_channels + 2 * config.state_embedding_dim
         self.adapters = nn.ModuleList(
             [
@@ -164,6 +172,7 @@ class EvidenceReliableFusion(nn.Module):
         images: torch.Tensor,
         modality_mask: torch.Tensor | None = None,
         modality_state: torch.Tensor | None = None,
+        modality_confidence: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | Mapping[str, torch.Tensor]]:
         if images.ndim != 5:
             raise ValueError(f"Expected images [B,M,D,H,W], got {tuple(images.shape)}")
@@ -185,6 +194,28 @@ class EvidenceReliableFusion(nn.Module):
             modality_state = modality_state.to(device=device, dtype=torch.long)
         if torch.any(modality_mask.sum(dim=1) <= 0):
             raise ValueError("Every sample must include at least one observed modality.")
+        if modality_confidence is None:
+            modality_confidence = torch.ones(b, m, dtype=dtype, device=device)
+        else:
+            valid_confidence_shape = modality_confidence.shape in (
+                (b, m),
+                (b, m, d, h, w),
+            )
+            if not valid_confidence_shape:
+                raise ValueError(
+                    "Expected modality_confidence shape "
+                    f"{(b, m)} or {(b, m, d, h, w)}, got "
+                    f"{tuple(modality_confidence.shape)}"
+                )
+            modality_confidence = modality_confidence.to(device=device, dtype=dtype)
+            if torch.any((modality_confidence < 0) | (modality_confidence > 1)):
+                raise ValueError("modality_confidence values must be in [0, 1].")
+        if modality_confidence.ndim == 2:
+            effective_confidence = modality_confidence * modality_mask
+        else:
+            effective_confidence = modality_confidence * modality_mask.view(
+                b, m, 1, 1, 1
+            )
 
         target_spatial = (d, h, w)
         features = []
@@ -193,12 +224,25 @@ class EvidenceReliableFusion(nn.Module):
         feature_spatial = None
         for index in range(self.num_modalities):
             x = images[:, index : index + 1].contiguous()
+            # Mask before encoding so retained training targets cannot leak
+            # through encoder normalization/statistics into observed evidence.
+            observed = modality_mask[:, index].view(b, 1, 1, 1, 1)
+            x = x * observed
             feature = self.encoder(x)[self.feature_stage]
             if feature_spatial is None:
                 feature_spatial = feature.shape[2:]
             feature = self._apply_adapter(feature, modality_state[:, index], index)
-            observed = modality_mask[:, index].view(b, 1, 1, 1, 1)
-            feature = feature * observed
+            confidence = effective_confidence[:, index]
+            if confidence.ndim == 1:
+                confidence = confidence.view(b, 1, 1, 1, 1)
+            else:
+                confidence = F.interpolate(
+                    confidence.unsqueeze(1),
+                    size=feature.shape[2:],
+                    mode="trilinear",
+                    align_corners=False,
+                )
+            feature = feature * confidence
             features.append(feature)
 
             logits = self.aux_decoders[index](feature, target_spatial)
@@ -215,12 +259,17 @@ class EvidenceReliableFusion(nn.Module):
         stacked_features = torch.stack(features, dim=1)
         stacked_aux = torch.stack(aux_logits, dim=1)
         stacked_aux_low = torch.stack(aux_logits_low, dim=1)
-        conflict_low = self._conflict_map(stacked_aux_low, modality_mask)
+        conflict_low = self._conflict_map(
+            stacked_aux_low,
+            modality_mask,
+            effective_confidence,
+        )
         gates = self._evidence_gates(
             stacked_features,
             stacked_aux_low,
             conflict_low,
             modality_mask,
+            effective_confidence,
         )
         fused_by_region = (
             gates.unsqueeze(3) * stacked_features.unsqueeze(1)
@@ -256,6 +305,7 @@ class EvidenceReliableFusion(nn.Module):
             "conflict_low": conflict_low,
             "modality_mask": modality_mask,
             "modality_state": modality_state,
+            "modality_confidence": modality_confidence,
         }
 
     def _apply_adapter(
@@ -272,7 +322,7 @@ class EvidenceReliableFusion(nn.Module):
             device=feature.device,
         )
         modality_emb = self.modality_embedding(modality_ids)
-        state_emb = self.state_embedding(state.clamp(0, 2))
+        state_emb = self.state_embedding(state.clamp(0, 3))
         condition = torch.cat([modality_emb, state_emb], dim=1)
         condition = condition.view(b, -1, 1, 1, 1).expand(b, -1, d, h, w)
         return feature + self.adapters[modality_index](
@@ -285,6 +335,7 @@ class EvidenceReliableFusion(nn.Module):
         aux_logits_low: torch.Tensor,
         conflict_low: torch.Tensor,
         modality_mask: torch.Tensor,
+        modality_confidence: torch.Tensor,
     ) -> torch.Tensor:
         b, m, c, d, h, w = features.shape
         flat_features = features.reshape(b, m * c, d, h, w)
@@ -297,6 +348,18 @@ class EvidenceReliableFusion(nn.Module):
         gate_logits = self.gate_net(gate_input).view(
             b, self.num_regions, self.num_modalities, d, h, w
         )
+        if modality_confidence.ndim == 2:
+            confidence_prior = modality_confidence.view(b, m, 1, 1, 1)
+        else:
+            confidence_prior = F.interpolate(
+                modality_confidence.reshape(
+                    b * m, 1, *modality_confidence.shape[-3:]
+                ),
+                size=(d, h, w),
+                mode="trilinear",
+                align_corners=False,
+            ).reshape(b, m, d, h, w)
+        gate_logits = gate_logits + confidence_prior.clamp_min(1e-6).log().unsqueeze(1)
         missing = modality_mask.view(b, 1, m, 1, 1, 1) <= 0
         gate_logits = gate_logits.masked_fill(missing, -1e4)
         return torch.softmax(gate_logits, dim=2)
@@ -305,11 +368,27 @@ class EvidenceReliableFusion(nn.Module):
         self,
         aux_logits_low: torch.Tensor,
         modality_mask: torch.Tensor,
+        modality_confidence: torch.Tensor,
     ) -> torch.Tensor:
         probs = torch.sigmoid(aux_logits_low)
         b, m, k, d, h, w = probs.shape
-        mask = modality_mask.view(b, m, 1, 1, 1, 1).to(probs.dtype)
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        mean = (probs * mask).sum(dim=1) / denom
-        variance = ((probs - mean.unsqueeze(1)).pow(2) * mask).sum(dim=1) / denom
+        if modality_confidence.ndim == 2:
+            confidence = modality_confidence.view(b, m, 1, 1, 1)
+        else:
+            confidence = F.interpolate(
+                modality_confidence.reshape(
+                    b * m, 1, *modality_confidence.shape[-3:]
+                ),
+                size=(d, h, w),
+                mode="trilinear",
+                align_corners=False,
+            ).reshape(b, m, d, h, w)
+        weights = (
+            modality_mask.view(b, m, 1, 1, 1) * confidence
+        ).unsqueeze(2).to(probs.dtype)
+        denom = weights.sum(dim=1).clamp_min(1e-6)
+        mean = (probs * weights).sum(dim=1) / denom
+        variance = (
+            (probs - mean.unsqueeze(1)).pow(2) * weights
+        ).sum(dim=1) / denom
         return (variance + 1e-6).sqrt()
