@@ -29,6 +29,10 @@ from models.prompted_slice_virtual_modality_generator import (  # noqa: E402
     PromptedSliceVirtualModalityGenerator,
     PromptedSliceVirtualModalityGeneratorConfig,
 )
+from models.slice_drift_transport_generator import (  # noqa: E402
+    SliceDriftTransportGenerator,
+    SliceDriftTransportGeneratorConfig,
+)
 from scripts.smoke_evidence_fusion_brats import environment, git_commit  # noqa: E402
 from utils.brats_metrics import dice_scores, segmentation_loss  # noqa: E402
 from utils.torch_drift_loss import drift_loss  # noqa: E402
@@ -64,15 +68,26 @@ def parse_args() -> argparse.Namespace:
         default="none",
         choices=("none", "region_balanced"),
     )
+    parser.add_argument("--hard-slice-json", default="")
+    parser.add_argument("--hard-slice-prob", type=float, default=0.0)
+    parser.add_argument("--hard-slice-min-score", type=float, default=0.0)
+    parser.add_argument("--hard-slice-top-k", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-train-steps", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--model-kind", default="slice", choices=("slice", "prompted"))
+    parser.add_argument("--model-kind", default="slice", choices=("slice", "prompted", "transport"))
     parser.add_argument("--freeze-base-generator", action="store_true")
     parser.add_argument("--detail-only-refinement", action="store_true")
     parser.add_argument("--train-prompt-with-detail", action="store_true")
     parser.add_argument("--hidden-channels", type=int, default=32)
+    parser.add_argument("--transport-steps", type=int, default=4)
+    parser.add_argument("--transport-step-scale", type=float, default=1.0)
+    parser.add_argument("--transport-velocity-scale", type=float, default=1.0)
+    parser.add_argument("--transport-init-blur-kernel", type=int, default=5)
+    parser.add_argument("--transport-velocity-weight", type=float, default=0.0)
+    parser.add_argument("--transport-path-weight", type=float, default=0.0)
+    parser.add_argument("--transport-monotonic-weight", type=float, default=0.0)
     parser.add_argument("--residual-scale", type=float, default=0.35)
     parser.add_argument("--lesion-residual-scale", type=float, default=0.45)
     parser.add_argument("--detail-residual-scale", type=float, default=0.20)
@@ -110,6 +125,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--region-moment-weight", type=float, default=0.0)
     parser.add_argument("--edge-weight", type=float, default=0.0)
     parser.add_argument("--enhancement-under-weight", type=float, default=0.0)
+    parser.add_argument("--lesion-boundary-weight", type=float, default=0.0)
+    parser.add_argument("--enhancement-contrast-weight", type=float, default=0.0)
     parser.add_argument("--lesion-residual-target-weight", type=float, default=0.0)
     parser.add_argument("--enhancement-residual-target-weight", type=float, default=0.0)
     parser.add_argument("--enhancement-leak-weight", type=float, default=0.0)
@@ -130,6 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--focus-wt", type=float, default=0.35)
     parser.add_argument("--resume-checkpoint", default="")
     parser.add_argument("--seed", type=int, default=46)
+    parser.add_argument("--split-seed", type=int, default=-1)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument(
         "--output-dir",
@@ -162,6 +180,72 @@ def brats_region_targets_np(seg: np.ndarray) -> np.ndarray:
     return np.stack([et, tc, wt], axis=0).astype(np.float32)
 
 
+def load_hard_slice_index(
+    path: str | Path,
+    min_score: float = 0.0,
+    top_k: int = 0,
+) -> tuple[dict[str, list[tuple[int, float]]], dict[str, Any]]:
+    if not path:
+        return {}, {"path": "", "subjects": 0, "slices": 0}
+    source = Path(path)
+    if not source.exists():
+        raise FileNotFoundError(f"hard slice file not found: {source}")
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        records = payload.get("records", payload.get("cases", []))
+    elif isinstance(payload, list):
+        records = payload
+    else:
+        raise ValueError(f"Unsupported hard slice payload type: {type(payload).__name__}")
+    grouped: dict[str, dict[int, float]] = {}
+    dropped = 0
+    for item in records:
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        subject_id = str(item.get("subject_id", "")).strip()
+        raw_slice = item.get("slice_index", item.get("z", None))
+        if not subject_id or raw_slice is None:
+            dropped += 1
+            continue
+        score = float(
+            item.get(
+                "score",
+                item.get(
+                    "hard_score",
+                    item.get(
+                        "mae_ET",
+                        item.get("mae_TC", item.get("mae_WT", item.get("mae", 0.0))),
+                    ),
+                ),
+            )
+            or 0.0
+        )
+        if score < float(min_score):
+            dropped += 1
+            continue
+        slice_index = int(raw_slice)
+        subject = grouped.setdefault(subject_id, {})
+        subject[slice_index] = max(subject.get(slice_index, float("-inf")), score)
+    top_k = int(top_k)
+    hard_slices: dict[str, list[tuple[int, float]]] = {}
+    for subject_id, slices in grouped.items():
+        ordered = sorted(slices.items(), key=lambda item: item[1], reverse=True)
+        if top_k > 0:
+            ordered = ordered[:top_k]
+        if ordered:
+            hard_slices[subject_id] = [(int(z), float(score)) for z, score in ordered]
+    total = sum(len(items) for items in hard_slices.values())
+    return hard_slices, {
+        "path": str(source),
+        "subjects": len(hard_slices),
+        "slices": total,
+        "min_score": float(min_score),
+        "top_k": top_k,
+        "dropped_records": dropped,
+    }
+
+
 class BraTSSliceDataset(Dataset):
     def __init__(
         self,
@@ -175,6 +259,8 @@ class BraTSSliceDataset(Dataset):
         slice_crop_size: int = 0,
         slice_crop_jitter: int = 8,
         slice_crop_mode: str = "none",
+        hard_slices: dict[str, list[tuple[int, float]]] | None = None,
+        hard_slice_prob: float = 0.0,
     ) -> None:
         rows = read_rows(manifest_csv)
         if max_subjects is not None:
@@ -192,6 +278,8 @@ class BraTSSliceDataset(Dataset):
         self.slice_crop_size = int(max(0, slice_crop_size))
         self.slice_crop_jitter = int(max(0, slice_crop_jitter))
         self.slice_crop_mode = slice_crop_mode
+        self.hard_slices = hard_slices or {}
+        self.hard_slice_prob = float(max(0.0, min(1.0, hard_slice_prob)))
 
     def __len__(self) -> int:
         return len(self.rows) * self.slices_per_subject
@@ -203,7 +291,7 @@ class BraTSSliceDataset(Dataset):
         image = np.load(row["multimodal_path"]).astype(np.float32, copy=False)
         seg = np.load(row["seg_path"]).astype(np.int64, copy=False)
         rng = random.Random(self.seed + row_index * 1009 + local_index * 9176)
-        z = self._sample_slice(seg, rng)
+        z = self._sample_slice(seg, rng, row["subject_id"])
         image_slice = self._context_slices(image, z)
         target = torch.from_numpy(brats_region_targets_np(seg[:, :, z]))
         if self.slice_crop_mode == "region_balanced" and self.slice_crop_size > 0:
@@ -241,8 +329,21 @@ class BraTSSliceDataset(Dataset):
             "slice_index": z,
         }
 
-    @staticmethod
-    def _sample_slice(seg: np.ndarray, rng: random.Random) -> int:
+    def _sample_slice(self, seg: np.ndarray, rng: random.Random, subject_id: str) -> int:
+        hard_slices = self.hard_slices.get(subject_id)
+        if hard_slices and rng.random() < self.hard_slice_prob:
+            depth = int(seg.shape[-1])
+            valid = [(z, score) for z, score in hard_slices if 0 <= int(z) < depth]
+            if valid:
+                weights = [max(float(score), 1e-4) for _, score in valid]
+                total = sum(weights)
+                cursor = rng.random() * total
+                running = 0.0
+                for (z, _), weight in zip(valid, weights):
+                    running += weight
+                    if running >= cursor:
+                        return int(z)
+                return int(valid[-1][0])
         # Prefer slices containing enhancing tumor or tumor core; fall back to any foreground.
         candidates = np.where(((seg == 3) | (seg == 1)).sum(axis=(0, 1)) > 0)[0]
         if candidates.size == 0:
@@ -296,6 +397,42 @@ class BraTSSliceDataset(Dataset):
         )
 
 
+def subject_level_split_indices(
+    dataset: BraTSSliceDataset,
+    val_subjects: int,
+    seed: int,
+) -> tuple[list[int], list[int], dict[str, Any]]:
+    row_count = len(dataset.rows)
+    if row_count <= 1:
+        indices = list(range(len(dataset)))
+        return indices, indices, {"mode": "single_subject_fallback", "val_subjects": row_count}
+    val_count = min(max(1, int(val_subjects)), max(1, row_count // 4))
+    rows = list(range(row_count))
+    rng = random.Random(int(seed))
+    rng.shuffle(rows)
+    val_rows = set(rows[:val_count])
+    train_rows = [row for row in rows[val_count:]]
+    if not train_rows:
+        train_rows = [rows[-1]]
+        val_rows = set(rows[:-1])
+    train_indices = [
+        row * dataset.slices_per_subject + local
+        for row in train_rows
+        for local in range(dataset.slices_per_subject)
+    ]
+    val_indices = [
+        row * dataset.slices_per_subject + local
+        for row in sorted(val_rows)
+        for local in range(dataset.slices_per_subject)
+    ]
+    return train_indices, val_indices, {
+        "mode": "subject_random",
+        "seed": int(seed),
+        "train_subjects": len(train_rows),
+        "val_subjects": len(val_rows),
+    }
+
+
 def to_device(batch: dict[str, Any], device: str) -> dict[str, Any]:
     return {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
 
@@ -309,6 +446,20 @@ def class_condition_from_batch(batch: dict[str, Any], device: str) -> torch.Tens
         if name in BRATS_DATASETS:
             condition[row_index, BRATS_DATASETS.index(name)] = 1.0
     return condition
+
+
+def generator_forward(
+    model: torch.nn.Module,
+    image: torch.Tensor,
+    observed_mask: torch.Tensor,
+    batch: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    class_condition = (
+        class_condition_from_batch(batch, image.device)
+        if getattr(model.config, "class_conditioned", False)
+        else None
+    )
+    return model(image, observed_mask, class_condition)
 
 
 def region_focus(
@@ -336,6 +487,68 @@ def region_focus(
 
 def weighted_mean(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return (value * weight).sum() / weight.sum().clamp_min(1e-8)
+
+
+def transport_velocity_loss(
+    generated: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    focus: torch.Tensor,
+    step_scale: float,
+) -> torch.Tensor:
+    states = generated.get("drift_states")
+    velocities = generated.get("drift_velocities")
+    if states is None or velocities is None:
+        return target.new_zeros(())
+    steps = int(velocities.shape[1])
+    if steps <= 0:
+        return target.new_zeros(())
+    scale = max(float(step_scale), 1e-6)
+    loss = target.new_zeros(())
+    for step in range(steps):
+        current = states[:, step].detach()
+        remaining = max(steps - step, 1)
+        ideal_velocity = (target - current) / (float(remaining) * scale)
+        error = F.smooth_l1_loss(
+            velocities[:, step],
+            ideal_velocity,
+            reduction="none",
+            beta=0.05,
+        )
+        loss = loss + weighted_mean(error, focus)
+    return loss / float(steps)
+
+
+def transport_path_loss(
+    generated: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    focus: torch.Tensor,
+) -> torch.Tensor:
+    states = generated.get("drift_states")
+    if states is None or states.shape[1] <= 1:
+        return target.new_zeros(())
+    steps = int(states.shape[1] - 1)
+    initial = states[:, 0].detach()
+    loss = target.new_zeros(())
+    for step in range(1, steps + 1):
+        alpha = float(step) / float(steps)
+        waypoint = initial + alpha * (target - initial)
+        loss = loss + weighted_mean((states[:, step] - waypoint).abs(), focus)
+    return loss / float(steps)
+
+
+def transport_monotonic_loss(
+    generated: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    focus: torch.Tensor,
+) -> torch.Tensor:
+    states = generated.get("drift_states")
+    if states is None or states.shape[1] <= 1:
+        return target.new_zeros(())
+    target_path = target.unsqueeze(1)
+    previous_error = (states[:, :-1] - target_path).abs()
+    next_error = (states[:, 1:] - target_path).abs()
+    penalty = F.relu(next_error - previous_error.detach())
+    return weighted_mean(penalty, focus.unsqueeze(1))
 
 
 def observed_brain_support(
@@ -427,6 +640,61 @@ def enhancement_under_loss(
     if not (et > 0.5).any():
         return synthetic.new_zeros(())
     return weighted_mean(F.relu(target - synthetic), et.clamp_min(1e-4))
+
+
+def lesion_boundary_band_loss(
+    synthetic: torch.Tensor,
+    target: torch.Tensor,
+    target_regions: torch.Tensor,
+    dilation: int,
+) -> torch.Tensor:
+    et = target_regions[:, 0:1].float()
+    tc = target_regions[:, 1:2].float()
+    lesion = ((et + tc) > 0.5).float()
+    if not (lesion > 0.5).any():
+        return synthetic.new_zeros(())
+    radius = max(1, int(dilation) + 1)
+    kernel = 2 * radius + 1
+    outer = F.max_pool2d(lesion, kernel_size=kernel, stride=1, padding=radius)
+    inner = -F.max_pool2d(-lesion, kernel_size=kernel, stride=1, padding=radius)
+    band = (outer - inner).clamp(0.0, 1.0)
+    if not (band > 0.0).any():
+        return synthetic.new_zeros(())
+    intensity = F.smooth_l1_loss(synthetic, target, reduction="none", beta=0.04)
+    edge = (edge_magnitude_2d(synthetic) - edge_magnitude_2d(target)).abs()
+    return weighted_mean(intensity + 0.5 * edge, band.clamp_min(1e-4))
+
+
+def enhancement_contrast_loss(
+    synthetic: torch.Tensor,
+    target: torch.Tensor,
+    target_regions: torch.Tensor,
+    dilation: int,
+) -> torch.Tensor:
+    et = target_regions[:, 0:1].float()
+    wt = target_regions[:, 2:3].float()
+    if not (et > 0.5).any():
+        return synthetic.new_zeros(())
+    radius = max(1, int(dilation) + 2)
+    kernel = 2 * radius + 1
+    outer = F.max_pool2d(wt, kernel_size=kernel, stride=1, padding=radius)
+    ring = (outer - wt).clamp(0.0, 1.0)
+    terms = []
+    for sample_index in range(synthetic.shape[0]):
+        lesion_mask = et[sample_index : sample_index + 1] > 0.5
+        ring_mask = ring[sample_index : sample_index + 1] > 0.5
+        if not lesion_mask.any() or not ring_mask.any():
+            continue
+        pred_contrast = synthetic[sample_index : sample_index + 1][lesion_mask].mean() - synthetic[
+            sample_index : sample_index + 1
+        ][ring_mask].mean()
+        target_contrast = target[sample_index : sample_index + 1][lesion_mask].mean() - target[
+            sample_index : sample_index + 1
+        ][ring_mask].mean()
+        terms.append(F.smooth_l1_loss(pred_contrast, target_contrast.detach(), beta=0.04))
+    if not terms:
+        return synthetic.new_zeros(())
+    return torch.stack(terms).mean()
 
 
 def lesion_residual_target_loss(
@@ -1079,11 +1347,7 @@ def loss_for_batch(
     image = batch["image"]
     target_index = int(batch["target_index"][0].item())
     target = image[:, target_index : target_index + 1]
-    generated = model(
-        image,
-        batch["observed_mask"],
-        class_condition_from_batch(batch, image.device) if args.class_conditioned else None,
-    )
+    generated = generator_forward(model, image, batch["observed_mask"], batch)
     synthetic = generated["synthetic"]
     uncertainty = generated["uncertainty"]
     focus = region_focus(
@@ -1161,6 +1425,26 @@ def loss_for_batch(
             args.medical_drift_token_clamp,
             args.medical_drift_max_current_tokens,
         )
+    transport_velocity = (
+        transport_velocity_loss(
+            generated,
+            target,
+            focus,
+            args.transport_step_scale,
+        )
+        if float(args.transport_velocity_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    transport_path = (
+        transport_path_loss(generated, target, focus)
+        if float(args.transport_path_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    transport_monotonic = (
+        transport_monotonic_loss(generated, target, focus)
+        if float(args.transport_monotonic_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
     lesion_texture = (
         lesion_texture_loss(synthetic, target, batch["target_regions"], args.focus_dilation)
         if float(args.lesion_texture_weight) > 0.0
@@ -1179,6 +1463,16 @@ def loss_for_batch(
     enhance_under = (
         enhancement_under_loss(synthetic, target, batch["target_regions"])
         if float(args.enhancement_under_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    lesion_boundary = (
+        lesion_boundary_band_loss(synthetic, target, batch["target_regions"], args.focus_dilation)
+        if float(args.lesion_boundary_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    enhancement_contrast = (
+        enhancement_contrast_loss(synthetic, target, batch["target_regions"], args.focus_dilation)
+        if float(args.enhancement_contrast_weight) > 0.0
         else synthetic.new_zeros(())
     )
     lesion_residual_target = (
@@ -1237,10 +1531,15 @@ def loss_for_batch(
         + float(args.window_drift_weight) * window_drift
         + float(args.window_feature_weight) * window_feature
         + float(args.medical_drift_weight) * medical_drift
+        + float(args.transport_velocity_weight) * transport_velocity
+        + float(args.transport_path_weight) * transport_path
+        + float(args.transport_monotonic_weight) * transport_monotonic
         + float(args.lesion_texture_weight) * lesion_texture
         + float(args.region_moment_weight) * region_moment
         + float(args.edge_weight) * edge
         + float(args.enhancement_under_weight) * enhance_under
+        + float(args.lesion_boundary_weight) * lesion_boundary
+        + float(args.enhancement_contrast_weight) * enhancement_contrast
         + float(args.lesion_residual_target_weight) * lesion_residual_target
         + float(args.enhancement_residual_target_weight) * enhancement_residual_target
         + float(args.enhancement_leak_weight) * enhancement_leak
@@ -1257,10 +1556,15 @@ def loss_for_batch(
         "window_drift_loss": float(window_drift.detach().cpu().item()),
         "window_feature_loss": float(window_feature.detach().cpu().item()),
         "medical_drift_loss": float(medical_drift.detach().cpu().item()),
+        "transport_velocity_loss": float(transport_velocity.detach().cpu().item()),
+        "transport_path_loss": float(transport_path.detach().cpu().item()),
+        "transport_monotonic_loss": float(transport_monotonic.detach().cpu().item()),
         "lesion_texture": float(lesion_texture.detach().cpu().item()),
         "region_moment": float(region_moment.detach().cpu().item()),
         "tumor_edge": float(edge.detach().cpu().item()),
         "enhancement_under": float(enhance_under.detach().cpu().item()),
+        "lesion_boundary": float(lesion_boundary.detach().cpu().item()),
+        "enhancement_contrast": float(enhancement_contrast.detach().cpu().item()),
         "lesion_residual_target": float(lesion_residual_target.detach().cpu().item()),
         "enhancement_residual_target": float(enhancement_residual_target.detach().cpu().item()),
         "enhancement_leak": float(enhancement_leak.detach().cpu().item()),
@@ -1285,7 +1589,7 @@ def pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> float:
 
 @torch.no_grad()
 def evaluate(
-    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator,
+    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
     loader: DataLoader,
     device: str,
 ) -> dict[str, float]:
@@ -1296,13 +1600,7 @@ def evaluate(
         image = batch["image"]
         target_index = int(batch["target_index"][0].item())
         target = image[:, target_index : target_index + 1]
-        generated = model(
-            image,
-            batch["observed_mask"],
-            class_condition_from_batch(batch, image.device)
-            if getattr(model.config, "class_conditioned", False)
-            else None,
-        )
+        generated = generator_forward(model, image, batch["observed_mask"], batch)
         synthetic = generated["synthetic"]
         error = (synthetic - target).abs()
         synthetic_features = conv_medical_features_2d(synthetic)
@@ -1367,7 +1665,7 @@ def evaluate(
 
 
 def train_one_epoch(
-    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator,
+    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: str,
@@ -1428,7 +1726,9 @@ def train_one_epoch(
     }
 
 
-def build_model(args: argparse.Namespace) -> SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator:
+def build_model(
+    args: argparse.Namespace,
+) -> SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator:
     in_modalities = len(BRATS_MODALITIES) * (2 * int(args.slice_context_radius) + 1)
     if args.model_kind == "prompted":
         return PromptedSliceVirtualModalityGenerator(
@@ -1446,6 +1746,20 @@ def build_model(args: argparse.Namespace) -> SliceVirtualModalityGenerator | Pro
                 positive_lesion_residual=args.positive_lesion_residual,
             )
         )
+    if args.model_kind == "transport":
+        return SliceDriftTransportGenerator(
+            SliceDriftTransportGeneratorConfig(
+                hidden_channels=args.hidden_channels,
+                in_modalities=in_modalities,
+                transport_steps=args.transport_steps,
+                transport_step_scale=args.transport_step_scale,
+                velocity_scale=args.transport_velocity_scale,
+                init_blur_kernel=args.transport_init_blur_kernel,
+                class_channels=len(BRATS_DATASETS),
+                class_conditioned=args.class_conditioned,
+                output_activation=args.output_activation,
+            )
+        )
     return SliceVirtualModalityGenerator(
         SliceVirtualModalityGeneratorConfig(
             hidden_channels=args.hidden_channels,
@@ -1455,7 +1769,7 @@ def build_model(args: argparse.Namespace) -> SliceVirtualModalityGenerator | Pro
 
 
 def remap_checkpoint_state(
-    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator,
+    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
     state: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     mapped = dict(state)
@@ -1508,7 +1822,7 @@ def remap_checkpoint_state(
 
 
 def freeze_prompted_base(
-    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator,
+    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
     detail_only: bool = False,
     train_prompt_with_detail: bool = False,
 ) -> dict[str, int]:
@@ -1547,7 +1861,7 @@ def trainable_parameters(model: torch.nn.Module) -> list[torch.nn.Parameter]:
 
 
 def reset_lesion_residual_head(
-    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator,
+    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
     bias: float | None,
 ) -> bool:
     if bias is None or not isinstance(model, PromptedSliceVirtualModalityGenerator):
@@ -1577,7 +1891,12 @@ def main() -> int:
         raise RuntimeError("CUDA requested but unavailable")
     set_seed(args.seed)
     max_subjects = None if args.max_subjects <= 0 else args.max_subjects
-    dataset = BraTSSliceDataset(
+    hard_slices, hard_slice_report = load_hard_slice_index(
+        args.hard_slice_json,
+        args.hard_slice_min_score,
+        args.hard_slice_top_k,
+    )
+    split_dataset = BraTSSliceDataset(
         args.manifest,
         spatial_size=args.spatial_size,
         max_subjects=max_subjects,
@@ -1589,10 +1908,29 @@ def main() -> int:
         slice_crop_mode=args.slice_crop_mode,
         slice_context_radius=args.slice_context_radius,
     )
-    val_count = min(int(args.val_subjects) * int(args.slices_per_subject), max(1, len(dataset) // 4))
-    train_count = len(dataset) - val_count
-    train_set = Subset(dataset, list(range(train_count)))
-    val_set = Subset(dataset, list(range(train_count, len(dataset))))
+    train_dataset = BraTSSliceDataset(
+        args.manifest,
+        spatial_size=args.spatial_size,
+        max_subjects=max_subjects,
+        slices_per_subject=args.slices_per_subject,
+        target_modality=args.target_modality,
+        seed=args.seed,
+        slice_crop_size=args.slice_crop_size,
+        slice_crop_jitter=args.slice_crop_jitter,
+        slice_crop_mode=args.slice_crop_mode,
+        slice_context_radius=args.slice_context_radius,
+        hard_slices=hard_slices,
+        hard_slice_prob=args.hard_slice_prob,
+    )
+    val_dataset = split_dataset
+    split_seed = int(args.seed if int(args.split_seed) < 0 else args.split_seed)
+    train_indices, val_indices, split_report = subject_level_split_indices(
+        split_dataset,
+        args.val_subjects,
+        split_seed,
+    )
+    train_set = Subset(train_dataset, train_indices)
+    val_set = Subset(val_dataset, val_indices)
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
@@ -1651,6 +1989,12 @@ def main() -> int:
     )
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / "slice_virtual_modality_generator_last.pt"
+    best_checkpoint_path = output_dir / "slice_virtual_modality_generator_best.pt"
+    best_eval = None
+    best_epoch = None
     started = time.perf_counter()
     epoch_reports = []
     eval_reports = []
@@ -1668,9 +2012,22 @@ def main() -> int:
         print(json.dumps({"epoch": epoch, **eval_report}), flush=True)
         epoch_reports.append(train_report)
         eval_reports.append({"epoch": epoch, "metrics": eval_report})
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / "slice_virtual_modality_generator_last.pt"
+        eval_mae = eval_report.get("mae")
+        if eval_mae is not None and math.isfinite(float(eval_mae)):
+            if best_eval is None or float(eval_mae) < float(best_eval["mae"]):
+                best_eval = dict(eval_report)
+                best_epoch = int(epoch)
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "config": vars(args),
+                        "target_modality": args.target_modality,
+                        "modalities": BRATS_MODALITIES,
+                        "best_epoch": best_epoch,
+                        "best_eval": best_eval,
+                    },
+                    best_checkpoint_path,
+                )
     torch.save(
         {
             "model": model.state_dict(),
@@ -1688,11 +2045,16 @@ def main() -> int:
         "resume": resume_report,
         "lesion_residual_head_reset": lesion_reset,
         "freeze": freeze_report,
+        "split": split_report,
+        "hard_slices": hard_slice_report | {"sampling_prob": float(args.hard_slice_prob)},
         "train_slices": len(train_set),
         "val_slices": len(val_set),
         "epochs": epoch_reports,
         "eval_by_epoch": eval_reports,
         "final_eval": eval_reports[-1]["metrics"] if eval_reports else {},
+        "best_epoch": best_epoch,
+        "best_eval": best_eval or {},
+        "best_checkpoint_path": str(best_checkpoint_path) if best_epoch is not None else None,
         "checkpoint_path": str(checkpoint_path),
         "memory": {
             "peak_allocated_mb": (

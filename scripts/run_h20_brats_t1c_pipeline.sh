@@ -8,9 +8,8 @@ set -Eeuo pipefail
 #   2. Install only missing runtime dependencies by default.
 #   3. Download BraTS2023 HF mirrors with resumable Hugging Face snapshots.
 #   4. Prepare model-ready arrays and manifests.
-#   5. Train a prompted base generator if no base checkpoint exists.
-#   6. Fine-tune the source-gated enhancement residual generator.
-#   7. Generate visual cases and a pipeline summary report.
+#   5. Train the iterative drift-transport missing-modality generator.
+#   6. Generate visual cases and a pipeline summary report.
 #
 # Typical H20 usage:
 #   cd /path/to/neuroState3D
@@ -32,7 +31,7 @@ ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_NAME="${RUN_NAME:-h20_t1c_sourcegate_${STAMP}}"
+RUN_NAME="${RUN_NAME:-h20_t1c_transport_${STAMP}}"
 
 DATA_ROOT="${DATA_ROOT:-${ROOT}/data}"
 RAW_ROOT="${RAW_ROOT:-${DATA_ROOT}/raw/BraTS2023_HF}"
@@ -91,6 +90,7 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 LOG_EVERY="${LOG_EVERY:-100}"
 SEED="${SEED:-46}"
+SPLIT_SEED="${SPLIT_SEED:-4601}"
 
 BASE_EPOCHS="${BASE_EPOCHS:-8}"
 BASE_MAX_TRAIN_STEPS="${BASE_MAX_TRAIN_STEPS:-0}"
@@ -104,11 +104,35 @@ FORCE_BASE_TRAIN="${FORCE_BASE_TRAIN:-0}"
 EPOCHS="${EPOCHS:-12}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-0}"
 LR="${LR:-6e-5}"
-FINAL_OUTPUT_DIR="${FINAL_OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}_enhancement}"
-FINAL_REPORT="${FINAL_REPORT:-${REPORT_DIR}/${RUN_NAME}_enhancement.json}"
+FINAL_OUTPUT_DIR="${FINAL_OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}_transport}"
+FINAL_REPORT="${FINAL_REPORT:-${REPORT_DIR}/${RUN_NAME}_transport.json}"
 FINAL_CHECKPOINT="${FINAL_OUTPUT_DIR}/slice_virtual_modality_generator_last.pt"
+FINAL_BEST_CHECKPOINT="${FINAL_OUTPUT_DIR}/slice_virtual_modality_generator_best.pt"
 FORCE_FINETUNE="${FORCE_FINETUNE:-0}"
 TRAIN_PROMPT_WITH_DETAIL="${TRAIN_PROMPT_WITH_DETAIL:-0}"
+TRAIN_PROMPTED_BASELINE="${TRAIN_PROMPTED_BASELINE:-0}"
+TRANSPORT_STEPS="${TRANSPORT_STEPS:-6}"
+TRANSPORT_STEP_SCALE="${TRANSPORT_STEP_SCALE:-1.0}"
+TRANSPORT_VELOCITY_SCALE="${TRANSPORT_VELOCITY_SCALE:-1.0}"
+TRANSPORT_INIT_BLUR_KERNEL="${TRANSPORT_INIT_BLUR_KERNEL:-5}"
+TRANSPORT_VELOCITY_WEIGHT="${TRANSPORT_VELOCITY_WEIGHT:-0.55}"
+TRANSPORT_PATH_WEIGHT="${TRANSPORT_PATH_WEIGHT:-0.25}"
+TRANSPORT_MONOTONIC_WEIGHT="${TRANSPORT_MONOTONIC_WEIGHT:-0.08}"
+
+TRAIN_STAGE2_HARD="${TRAIN_STAGE2_HARD:-1}"
+HARD_SLICE_JSON="${HARD_SLICE_JSON:-${REPORT_DIR}/${RUN_NAME}_hard_slices.json}"
+HARD_SLICE_PROB="${HARD_SLICE_PROB:-0.75}"
+HARD_SLICE_TOP_K="${HARD_SLICE_TOP_K:-3}"
+MINE_CANDIDATE_SLICES_PER_SUBJECT="${MINE_CANDIDATE_SLICES_PER_SUBJECT:-6}"
+MINE_TOP_SLICES_PER_SUBJECT="${MINE_TOP_SLICES_PER_SUBJECT:-3}"
+MINE_MAX_SUBJECTS="${MINE_MAX_SUBJECTS:-0}"
+STAGE2_EPOCHS="${STAGE2_EPOCHS:-6}"
+STAGE2_LR="${STAGE2_LR:-5e-5}"
+STAGE2_SLICE_CROP_SIZE="${STAGE2_SLICE_CROP_SIZE:-96}"
+STAGE2_OUTPUT_DIR="${STAGE2_OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}_transport_stage2_hard}"
+STAGE2_REPORT="${STAGE2_REPORT:-${REPORT_DIR}/${RUN_NAME}_transport_stage2_hard.json}"
+STAGE2_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_last.pt"
+STAGE2_BEST_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_best.pt"
 
 VIS_NUM_CASES="${VIS_NUM_CASES:-12}"
 VIS_DIR="${VIS_DIR:-${VIS_ROOT}/${RUN_NAME}}"
@@ -319,6 +343,7 @@ train_base_if_needed() {
     --focus-wt 0.2
     --background-weight 0.001
     --seed "${SEED}"
+    --split-seed "${SPLIT_SEED}"
     --log-every "${LOG_EVERY}"
     --output-dir "${BASE_OUTPUT_DIR}"
     --report-path "${BASE_REPORT}"
@@ -390,6 +415,7 @@ train_enhancement() {
     --background-weight 0.001
     --resume-checkpoint "${BASE_CHECKPOINT}"
     --seed "${SEED}"
+    --split-seed "${SPLIT_SEED}"
     --log-every "${LOG_EVERY}"
     --output-dir "${FINAL_OUTPUT_DIR}"
     --report-path "${FINAL_REPORT}"
@@ -409,15 +435,194 @@ train_enhancement() {
   run_stage train_enhancement "${finetune_args[@]}"
 }
 
+train_transport() {
+  if [[ "${FORCE_FINETUNE}" != "1" && -f "${FINAL_CHECKPOINT}" && -f "${FINAL_REPORT}" ]]; then
+    stage_log "Final checkpoint/report exist; skipping transport training."
+    return
+  fi
+
+  local transport_args=(
+    python scripts/train_slice_virtual_modality_drifting.py
+    --manifest "${MANIFEST}"
+    --device "${DEVICE}"
+    --model-kind transport
+    --target-modality "${TARGET_MODALITY}"
+    --spatial-size "${SPATIAL_SIZE}"
+    --max-subjects "${MAX_SUBJECTS}"
+    --val-subjects "${VAL_SUBJECTS}"
+    --slices-per-subject "${SLICES_PER_SUBJECT}"
+    --slice-crop-size "${SLICE_CROP_SIZE}"
+    --slice-crop-jitter "${SLICE_CROP_JITTER}"
+    --slice-crop-mode region_balanced
+    --epochs "${EPOCHS}"
+    --max-train-steps "${MAX_TRAIN_STEPS}"
+    --batch-size "${BATCH_SIZE}"
+    --num-workers "${NUM_WORKERS}"
+    --output-activation hardtanh
+    --transport-steps "${TRANSPORT_STEPS}"
+    --transport-step-scale "${TRANSPORT_STEP_SCALE}"
+    --transport-velocity-scale "${TRANSPORT_VELOCITY_SCALE}"
+    --transport-init-blur-kernel "${TRANSPORT_INIT_BLUR_KERNEL}"
+    --transport-velocity-weight "${TRANSPORT_VELOCITY_WEIGHT}"
+    --transport-path-weight "${TRANSPORT_PATH_WEIGHT}"
+    --transport-monotonic-weight "${TRANSPORT_MONOTONIC_WEIGHT}"
+    --lr "${LR}"
+    --recon-weight 1.0
+    --nll-weight 0.02
+    --gradient-weight 0.10
+    --drift-weight 0.0
+    --medical-drift-weight 0.004
+    --medical-drift-memory-tokens 64
+    --medical-drift-max-current-tokens 192
+    --medical-drift-max-add-tokens 768
+    --lesion-texture-weight 0.18
+    --region-moment-weight 0.05
+    --edge-weight 0.10
+    --enhancement-under-weight 0.30
+    --top-intensity-weight 0.35
+    --top-intensity-quantile 0.70
+    --focus-dilation 2
+    --focus-base 0.1
+    --focus-et 24
+    --focus-tc 8
+    --focus-wt 0.2
+    --background-weight 0.001
+    --seed "${SEED}"
+    --split-seed "${SPLIT_SEED}"
+    --log-every "${LOG_EVERY}"
+    --output-dir "${FINAL_OUTPUT_DIR}"
+    --report-path "${FINAL_REPORT}"
+  )
+
+  run_stage train_transport "${transport_args[@]}"
+}
+
+mine_hard_slices() {
+  local source_checkpoint="${FINAL_BEST_CHECKPOINT}"
+  if [[ ! -f "${source_checkpoint}" ]]; then
+    source_checkpoint="${FINAL_CHECKPOINT}"
+  fi
+  if [[ ! -f "${source_checkpoint}" ]]; then
+    echo "[ERROR] No transport checkpoint found for hard-slice mining." >&2
+    exit 6
+  fi
+  if [[ "${FORCE_FINETUNE}" != "1" && -f "${HARD_SLICE_JSON}" ]]; then
+    stage_log "Hard-slice JSON exists; skipping mining."
+    return
+  fi
+  run_stage mine_hard_slices \
+    python scripts/mine_hard_brats_slices.py \
+      --manifest "${MANIFEST}" \
+      --checkpoint "${source_checkpoint}" \
+      --device "${DEVICE}" \
+      --target-modality "${TARGET_MODALITY}" \
+      --spatial-size "${SPATIAL_SIZE}" \
+      --max-subjects "${MAX_SUBJECTS}" \
+      --val-subjects "${VAL_SUBJECTS}" \
+      --seed "${SEED}" \
+      --split-seed "${SPLIT_SEED}" \
+      --candidate-slices-per-subject "${MINE_CANDIDATE_SLICES_PER_SUBJECT}" \
+      --top-slices-per-subject "${MINE_TOP_SLICES_PER_SUBJECT}" \
+      --max-mine-subjects "${MINE_MAX_SUBJECTS}" \
+      --output-json "${HARD_SLICE_JSON}"
+}
+
+train_transport_stage2_hard() {
+  if [[ "${TRAIN_STAGE2_HARD}" != "1" ]]; then
+    stage_log "TRAIN_STAGE2_HARD=0; skipping hard-case transport fine-tune."
+    return
+  fi
+  local source_checkpoint="${FINAL_BEST_CHECKPOINT}"
+  if [[ ! -f "${source_checkpoint}" ]]; then
+    source_checkpoint="${FINAL_CHECKPOINT}"
+  fi
+  if [[ ! -f "${source_checkpoint}" ]]; then
+    echo "[ERROR] No transport checkpoint found for stage-2 fine-tune." >&2
+    exit 7
+  fi
+  if [[ "${FORCE_FINETUNE}" != "1" && -f "${STAGE2_CHECKPOINT}" && -f "${STAGE2_REPORT}" ]]; then
+    stage_log "Stage-2 checkpoint/report exist; skipping hard fine-tune."
+    return
+  fi
+  run_stage train_transport_stage2_hard \
+    python scripts/train_slice_virtual_modality_drifting.py \
+      --manifest "${MANIFEST}" \
+      --device "${DEVICE}" \
+      --model-kind transport \
+      --target-modality "${TARGET_MODALITY}" \
+      --spatial-size "${SPATIAL_SIZE}" \
+      --max-subjects "${MAX_SUBJECTS}" \
+      --val-subjects "${VAL_SUBJECTS}" \
+      --slices-per-subject "${SLICES_PER_SUBJECT}" \
+      --slice-crop-size "${STAGE2_SLICE_CROP_SIZE}" \
+      --slice-crop-jitter "${SLICE_CROP_JITTER}" \
+      --slice-crop-mode region_balanced \
+      --hard-slice-json "${HARD_SLICE_JSON}" \
+      --hard-slice-prob "${HARD_SLICE_PROB}" \
+      --hard-slice-top-k "${HARD_SLICE_TOP_K}" \
+      --epochs "${STAGE2_EPOCHS}" \
+      --max-train-steps "${MAX_TRAIN_STEPS}" \
+      --batch-size "${BATCH_SIZE}" \
+      --num-workers "${NUM_WORKERS}" \
+      --output-activation hardtanh \
+      --transport-steps "${TRANSPORT_STEPS}" \
+      --transport-step-scale "${TRANSPORT_STEP_SCALE}" \
+      --transport-velocity-scale "${TRANSPORT_VELOCITY_SCALE}" \
+      --transport-init-blur-kernel "${TRANSPORT_INIT_BLUR_KERNEL}" \
+      --transport-velocity-weight 0.45 \
+      --transport-path-weight 0.18 \
+      --transport-monotonic-weight 0.05 \
+      --lr "${STAGE2_LR}" \
+      --recon-weight 1.0 \
+      --nll-weight 0.02 \
+      --gradient-weight 0.12 \
+      --drift-weight 0.0 \
+      --window-feature-weight 0.05 \
+      --medical-drift-weight 0.003 \
+      --medical-drift-memory-tokens 64 \
+      --medical-drift-max-current-tokens 192 \
+      --medical-drift-max-add-tokens 768 \
+      --lesion-texture-weight 0.24 \
+      --region-moment-weight 0.06 \
+      --edge-weight 0.14 \
+      --enhancement-under-weight 0.45 \
+      --lesion-boundary-weight 0.28 \
+      --enhancement-contrast-weight 0.18 \
+      --top-intensity-weight 0.45 \
+      --top-intensity-quantile 0.72 \
+      --focus-dilation 3 \
+      --focus-base 0.08 \
+      --focus-et 30 \
+      --focus-tc 10 \
+      --focus-wt 0.25 \
+      --background-weight 0.001 \
+      --resume-checkpoint "${source_checkpoint}" \
+      --seed "${SEED}" \
+      --split-seed "${SPLIT_SEED}" \
+      --log-every "${LOG_EVERY}" \
+      --output-dir "${STAGE2_OUTPUT_DIR}" \
+      --report-path "${STAGE2_REPORT}"
+}
+
 visualize_cases() {
-  if [[ ! -f "${FINAL_CHECKPOINT}" ]]; then
-    echo "[ERROR] Final checkpoint missing before visualization: ${FINAL_CHECKPOINT}" >&2
+  local vis_checkpoint="${STAGE2_BEST_CHECKPOINT}"
+  if [[ ! -f "${vis_checkpoint}" ]]; then
+    vis_checkpoint="${STAGE2_CHECKPOINT}"
+  fi
+  if [[ ! -f "${vis_checkpoint}" ]]; then
+    vis_checkpoint="${FINAL_BEST_CHECKPOINT}"
+  fi
+  if [[ ! -f "${vis_checkpoint}" ]]; then
+    vis_checkpoint="${FINAL_CHECKPOINT}"
+  fi
+  if [[ ! -f "${vis_checkpoint}" ]]; then
+    echo "[ERROR] No checkpoint missing before visualization." >&2
     exit 5
   fi
   run_stage visualize_cases \
     python scripts/visualize_slice_virtual_modality_generation.py \
       --manifest "${MANIFEST}" \
-      --checkpoint "${FINAL_CHECKPOINT}" \
+      --checkpoint "${vis_checkpoint}" \
       --device "${DEVICE}" \
       --target-modality "${TARGET_MODALITY}" \
       --spatial-size "${SPATIAL_SIZE}" \
@@ -524,7 +729,7 @@ report = {
         "model_ready_npy": tree_stats(model_ready_root, "*.npy"),
     },
     "base_final_eval": (base or {}).get("final_eval", {}),
-    "enhancement_final_eval": (final or {}).get("final_eval", {}),
+    "transport_final_eval": (final or {}).get("final_eval", {}),
     "visual_summary": visual_summary,
 }
 report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -542,8 +747,12 @@ main() {
   fi
   ensure_environment
   download_and_prepare_data
-  train_base_if_needed
-  train_enhancement
+  if [[ "${TRAIN_PROMPTED_BASELINE}" == "1" ]]; then
+    train_base_if_needed
+  fi
+  train_transport
+  mine_hard_slices
+  train_transport_stage2_hard
   visualize_cases
   write_pipeline_report
   stage_log "ALL DONE"

@@ -30,6 +30,10 @@ from models.prompted_slice_virtual_modality_generator import (  # noqa: E402
     PromptedSliceVirtualModalityGenerator,
     PromptedSliceVirtualModalityGeneratorConfig,
 )
+from models.slice_drift_transport_generator import (  # noqa: E402
+    SliceDriftTransportGenerator,
+    SliceDriftTransportGeneratorConfig,
+)
 
 BRATS_DATASETS = ("GLI", "MEN", "PED")
 
@@ -53,6 +57,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-modality", default="", choices=("", *BRATS_MODALITIES))
     parser.add_argument("--spatial-size", type=int, default=128)
     parser.add_argument("--num-cases", type=int, default=6)
+    parser.add_argument(
+        "--case-selection",
+        default="representative",
+        choices=("representative", "best", "worst"),
+    )
+    parser.add_argument("--selection-pool", type=int, default=120)
     parser.add_argument("--batch-slices", type=int, default=16)
     parser.add_argument("--slice-crop-size", type=int, default=0)
     parser.add_argument("--apply-brain-mask", action="store_true")
@@ -74,7 +84,10 @@ def load_model(
     checkpoint_path: str | Path,
     device: str,
     override_target: str,
-) -> tuple[SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator, str]:
+) -> tuple[
+    SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
+    str,
+]:
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = payload.get("config", {})
     target = override_target or str(
@@ -97,6 +110,20 @@ def load_model(
                 class_conditioned=bool(config.get("class_conditioned", False)),
                 output_activation=str(config.get("output_activation", "tanh")),
                 positive_lesion_residual=bool(config.get("positive_lesion_residual", False)),
+            )
+        )
+    elif model_kind == "transport":
+        model = SliceDriftTransportGenerator(
+            SliceDriftTransportGeneratorConfig(
+                in_modalities=in_modalities,
+                hidden_channels=int(config.get("hidden_channels", 32)),
+                transport_steps=int(config.get("transport_steps", 4)),
+                transport_step_scale=float(config.get("transport_step_scale", 1.0)),
+                velocity_scale=float(config.get("transport_velocity_scale", 1.0)),
+                init_blur_kernel=int(config.get("transport_init_blur_kernel", 5)),
+                class_channels=len(BRATS_DATASETS),
+                class_conditioned=bool(config.get("class_conditioned", False)),
+                output_activation=str(config.get("output_activation", "hardtanh")),
             )
         )
     else:
@@ -125,6 +152,26 @@ def context_slice_tensor(
             zz = max(0, min(depth - 1, int(z) + offset))
             slices.append(image_np[modality_index, :, :, zz])
     return torch.from_numpy(np.stack(slices, axis=0).copy())
+
+
+def context_slice_batch(
+    image: torch.Tensor,
+    start: int,
+    end: int,
+    radius: int,
+) -> torch.Tensor:
+    if radius <= 0:
+        return image[:, :, :, start:end].permute(3, 0, 1, 2).contiguous()
+    depth = image.shape[-1]
+    batch_slices = []
+    for z in range(int(start), int(end)):
+        channels = []
+        for modality_index in range(image.shape[0]):
+            for offset in range(-int(radius), int(radius) + 1):
+                zz = max(0, min(depth - 1, z + offset))
+                channels.append(image[modality_index, :, :, zz])
+        batch_slices.append(torch.stack(channels, dim=0))
+    return torch.stack(batch_slices, dim=0)
 
 
 def resize_image(image: torch.Tensor, spatial_size: int) -> torch.Tensor:
@@ -169,7 +216,7 @@ def observed_brain_support_np(
 
 @torch.no_grad()
 def generate_volume(
-    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator,
+    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
     image: torch.Tensor,
     target_index: int,
     batch_slices: int,
@@ -177,8 +224,12 @@ def generate_volume(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     device = next(model.parameters()).device
     image = torch.nan_to_num(image.to(device), nan=0.0, posinf=1.0, neginf=-1.0).clamp(-3.0, 3.0)
-    mask = torch.ones(1, len(BRATS_MODALITIES), device=device)
-    mask[:, target_index] = 0.0
+    in_modalities = int(model.config.in_modalities)
+    context_depth = max(1, in_modalities // len(BRATS_MODALITIES))
+    context_radius = context_depth // 2
+    mask = torch.ones(1, in_modalities, device=device)
+    target_start = int(target_index) * context_depth
+    mask[:, target_start : target_start + context_depth] = 0.0
     class_condition = class_condition_from_name(dataset_name, device)
     _, _, _, width = image.shape
     synthetic_slices = []
@@ -187,7 +238,7 @@ def generate_volume(
     prompt_slices = []
     for start in range(0, width, int(batch_slices)):
         end = min(start + int(batch_slices), width)
-        slices = image[:, :, :, start:end].permute(3, 0, 1, 2).contiguous()
+        slices = context_slice_batch(image, start, end, context_radius)
         batch_mask = mask.expand(slices.shape[0], -1)
         batch_class = (
             class_condition.expand(slices.shape[0], -1)
@@ -278,7 +329,7 @@ def class_condition_from_name(dataset_name: str, device: torch.device) -> torch.
 
 @torch.no_grad()
 def generate_slice(
-    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator,
+    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
     image_slice: torch.Tensor,
     base_target_index: int,
     dataset_name: str = "",
@@ -356,6 +407,64 @@ def choose_cases(rows: list[dict[str, str]], num_cases: int) -> list[dict[str, s
 
 
 @torch.no_grad()
+def choose_cases_by_generation_error(
+    rows: list[dict[str, str]],
+    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
+    target_index: int,
+    spatial_size: int,
+    num_cases: int,
+    selection_pool: int,
+    mode: str,
+) -> list[dict[str, str]]:
+    if mode == "representative":
+        return choose_cases(rows, num_cases)
+    if not rows:
+        return []
+    pool_size = min(len(rows), max(int(num_cases), int(selection_pool)))
+    probe = np.linspace(0, len(rows) - 1, num=pool_size, dtype=int)
+    in_modalities = int(model.config.in_modalities)
+    context_depth = max(1, in_modalities // len(BRATS_MODALITIES))
+    context_radius = context_depth // 2
+    scored: list[tuple[float, dict[str, str]]] = []
+    for index in probe:
+        row = rows[int(index)]
+        try:
+            image = torch.from_numpy(np.load(row["multimodal_path"]).astype(np.float32, copy=False))
+            seg = torch.from_numpy(np.load(row["seg_path"]).astype(np.int64, copy=False))
+            image = resize_image(image, int(spatial_size))
+            seg = resize_seg(seg, int(spatial_size))
+            image_np = image.cpu().numpy()
+            seg_np = seg.cpu().numpy()
+            real = image_np[target_index]
+            z = selected_slice(seg_np, real)
+            context_tensor = context_slice_tensor(image_np, z, context_radius)
+            synthetic, _, _, _ = generate_slice(
+                model,
+                context_tensor,
+                target_index,
+                row["dataset"],
+            )
+            lesion = seg_np[:, :, z] > 0
+            if lesion.any():
+                score = float(np.abs(synthetic - real[:, :, z])[lesion].mean())
+            else:
+                score = float(np.abs(synthetic - real[:, :, z]).mean())
+            scored.append((score, row))
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "case_selection_skip": row.get("subject_id", ""),
+                        "error": type(exc).__name__ + ": " + str(exc),
+                    }
+                ),
+                flush=True,
+            )
+    reverse = mode == "worst"
+    return [row for _, row in sorted(scored, key=lambda item: item[0], reverse=reverse)[:num_cases]]
+
+
+@torch.no_grad()
 def main() -> int:
     args = parse_args()
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -364,7 +473,16 @@ def main() -> int:
     target_index = BRATS_MODALITIES.index(target_modality)
     context_depth = max(1, int(model.config.in_modalities) // len(BRATS_MODALITIES))
     context_radius = context_depth // 2
-    rows = choose_cases(read_rows(args.manifest), int(args.num_cases))
+    all_rows = read_rows(args.manifest)
+    rows = choose_cases_by_generation_error(
+        all_rows,
+        model,
+        target_index,
+        int(args.spatial_size),
+        int(args.num_cases),
+        int(args.selection_pool),
+        args.case_selection,
+    )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     case_records = []

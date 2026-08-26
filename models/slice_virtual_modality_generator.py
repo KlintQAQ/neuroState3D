@@ -98,7 +98,9 @@ class SliceVirtualModalityGenerator(nn.Module):
         self,
         slices: torch.Tensor,
         modality_mask: torch.Tensor,
+        class_condition: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
+        _ = class_condition
         if slices.ndim != 4:
             raise ValueError(f"Expected slices [B,M,H,W], got {tuple(slices.shape)}")
         b, m, h, w = slices.shape
