@@ -292,3 +292,35 @@ Before implementing teacher learning or diffusion, compare:
 
 Only proceed to spatial evidence fusion and state learning when these baselines
 are reproducible and logged.
+
+## H20 One-Command BraTS T1c Pipeline
+
+The H20 entry point for the current missing-T1c generation line is:
+
+```bash
+bash scripts/run_h20_brats_t1c_pipeline.sh
+```
+
+By default it runs inside the current project folder, creates or reuses a
+`neurostate3d` conda environment, installs missing dependencies only, downloads
+BraTS GLI/MEN/PED from Hugging Face, incrementally prepares model-ready arrays,
+trains the drift-transport generator, mines hard lesion slices, runs stage-2
+hard-case fine-tuning, generates visual cases, and writes a JSON pipeline
+summary.
+
+Useful H20 overrides:
+
+```bash
+USE_HF_MIRROR=1 DATA_ROOT=/data/NeuroState3D RUN_NAME=h20_full_t1c \
+  BATCH_SIZE=16 NUM_WORKERS=8 EPOCHS=12 STAGE2_EPOCHS=6 \
+  bash scripts/run_h20_brats_t1c_pipeline.sh
+```
+
+The script is resumable:
+
+- Existing Python dependencies are reused when import checks pass.
+- Existing raw NIfTI data are reused unless `FORCE_DOWNLOAD=1`.
+- Existing model-ready subjects are skipped unless `FORCE_PREPARE=1`.
+- Existing checkpoints/reports are skipped unless `FORCE_FINETUNE=1`.
+- Runtime artifacts stay under ignored folders such as `data/`, `outputs/`,
+  and `reports/`; they should not be committed.

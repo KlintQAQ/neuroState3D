@@ -72,6 +72,9 @@ DOWNLOAD_RETRIES="${DOWNLOAD_RETRIES:-30}"
 DOWNLOAD_RETRY_SLEEP="${DOWNLOAD_RETRY_SLEEP:-120}"
 FORCE_DOWNLOAD="${FORCE_DOWNLOAD:-0}"
 FORCE_PREPARE="${FORCE_PREPARE:-0}"
+SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
+SKIP_PREPARE="${SKIP_PREPARE:-0}"
+STREAM_PREPARE_BY_DATASET="${STREAM_PREPARE_BY_DATASET:-1}"
 PREPARE_WORKERS="${PREPARE_WORKERS:-8}"
 TARGET_SHAPE="${TARGET_SHAPE:-128 128 128}"
 CROP_MARGIN="${CROP_MARGIN:-8}"
@@ -135,6 +138,9 @@ STAGE2_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_last.pt
 STAGE2_BEST_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_best.pt"
 
 VIS_NUM_CASES="${VIS_NUM_CASES:-12}"
+VIS_CASE_SELECTION="${VIS_CASE_SELECTION:-representative}"
+VIS_SELECTION_POOL="${VIS_SELECTION_POOL:-240}"
+VIS_SLICE_CROP_SIZE="${VIS_SLICE_CROP_SIZE:-0}"
 VIS_DIR="${VIS_DIR:-${VIS_ROOT}/${RUN_NAME}}"
 PIPELINE_REPORT="${PIPELINE_REPORT:-${REPORT_DIR}/${RUN_NAME}_pipeline_summary.json}"
 
@@ -248,6 +254,50 @@ print(json.dumps({
 PY
 }
 
+prepare_model_ready() {
+  local stage_name="${1:-prepare_brats}"
+  if [[ "${SKIP_PREPARE}" == "1" ]]; then
+    stage_log "SKIP prepare because SKIP_PREPARE=1"
+    return
+  fi
+
+  read -r -a target_shape_args <<< "${TARGET_SHAPE}"
+  local prepare_args=(
+    python scripts/prepare_brats_model_ready.py
+    --raw-root "${RAW_ROOT}"
+    --output-root "${MODEL_READY_ROOT}"
+    --manifest-dir "${MANIFEST_DIR}"
+    --target-shape "${target_shape_args[@]}"
+    --crop-margin "${CROP_MARGIN}"
+    --workers "${PREPARE_WORKERS}"
+  )
+  if [[ "${FORCE_PREPARE}" == "1" ]]; then
+    prepare_args+=(--force)
+  fi
+  run_stage "${stage_name}" "${prepare_args[@]}"
+}
+
+download_one_dataset() {
+  local dataset_name="${1,,}"
+  local local_subdir="${dataset_name^^}"
+  local local_root="${RAW_ROOT}/${local_subdir}"
+  if [[ "${SKIP_DOWNLOAD}" == "1" ]]; then
+    stage_log "SKIP download for ${dataset_name} because SKIP_DOWNLOAD=1"
+    return
+  fi
+  if [[ "${FORCE_DOWNLOAD}" != "1" && "$(file_count "${local_root}" "*.nii.gz")" -gt 0 ]]; then
+    stage_log "Raw NIfTI files already exist for ${dataset_name}; skipping download."
+    return
+  fi
+  run_stage "download_brats_${dataset_name}" \
+    python scripts/download_brats_hf.py \
+      --datasets "${dataset_name}" \
+      --data-root "${DATA_ROOT}" \
+      --max-workers "${DOWNLOAD_MAX_WORKERS}" \
+      --retries "${DOWNLOAD_RETRIES}" \
+      --retry-sleep "${DOWNLOAD_RETRY_SLEEP}"
+}
+
 download_and_prepare_data() {
   local rows
   rows="$(csv_row_count "${MANIFEST}")"
@@ -257,27 +307,25 @@ download_and_prepare_data() {
   fi
 
   read -r -a dataset_args <<< "${DOWNLOAD_DATASETS}"
-  if [[ "${FORCE_DOWNLOAD}" == "1" || "$(file_count "${RAW_ROOT}" "*.nii.gz")" -eq 0 || "${rows}" -lt "${MIN_PROCESSED_SUBJECTS}" ]]; then
-    run_stage download_brats \
-      python scripts/download_brats_hf.py \
-        --datasets "${dataset_args[@]}" \
-        --data-root "${DATA_ROOT}" \
-        --max-workers "${DOWNLOAD_MAX_WORKERS}" \
-        --retries "${DOWNLOAD_RETRIES}" \
-        --retry-sleep "${DOWNLOAD_RETRY_SLEEP}"
+  if [[ "${STREAM_PREPARE_BY_DATASET}" == "1" ]]; then
+    for dataset_name in "${dataset_args[@]}"; do
+      download_one_dataset "${dataset_name}"
+      prepare_model_ready "prepare_brats_after_${dataset_name}"
+    done
   else
-    stage_log "Raw NIfTI files already exist; skipping download."
+    if [[ "${SKIP_DOWNLOAD}" != "1" ]]; then
+      run_stage download_brats \
+        python scripts/download_brats_hf.py \
+          --datasets "${dataset_args[@]}" \
+          --data-root "${DATA_ROOT}" \
+          --max-workers "${DOWNLOAD_MAX_WORKERS}" \
+          --retries "${DOWNLOAD_RETRIES}" \
+          --retry-sleep "${DOWNLOAD_RETRY_SLEEP}"
+    else
+      stage_log "SKIP download because SKIP_DOWNLOAD=1"
+    fi
+    prepare_model_ready prepare_brats
   fi
-
-  read -r -a target_shape_args <<< "${TARGET_SHAPE}"
-  run_stage prepare_brats \
-    python scripts/prepare_brats_model_ready.py \
-      --raw-root "${RAW_ROOT}" \
-      --output-root "${MODEL_READY_ROOT}" \
-      --manifest-dir "${MANIFEST_DIR}" \
-      --target-shape "${target_shape_args[@]}" \
-      --crop-margin "${CROP_MARGIN}" \
-      --workers "${PREPARE_WORKERS}"
 
   local prepared_rows
   prepared_rows="$(csv_row_count "${MANIFEST}")"
@@ -627,7 +675,9 @@ visualize_cases() {
       --target-modality "${TARGET_MODALITY}" \
       --spatial-size "${SPATIAL_SIZE}" \
       --num-cases "${VIS_NUM_CASES}" \
-      --slice-crop-size "${SLICE_CROP_SIZE}" \
+      --case-selection "${VIS_CASE_SELECTION}" \
+      --selection-pool "${VIS_SELECTION_POOL}" \
+      --slice-crop-size "${VIS_SLICE_CROP_SIZE}" \
       --apply-brain-mask \
       --output-dir "${VIS_DIR}"
 }
@@ -635,8 +685,9 @@ visualize_cases() {
 write_pipeline_report() {
   python - \
     "${PIPELINE_REPORT}" "${ROOT}" "${DATA_ROOT}" "${RAW_ROOT}" "${MODEL_READY_ROOT}" \
-    "${MANIFEST}" "${BASE_REPORT}" "${FINAL_REPORT}" "${VIS_DIR}" "${LOG_DIR}" \
-    "${BASE_CHECKPOINT}" "${FINAL_CHECKPOINT}" <<'PY'
+    "${MANIFEST}" "${BASE_REPORT}" "${FINAL_REPORT}" "${STAGE2_REPORT}" "${VIS_DIR}" "${LOG_DIR}" \
+    "${BASE_CHECKPOINT}" "${FINAL_CHECKPOINT}" "${FINAL_BEST_CHECKPOINT}" \
+    "${STAGE2_CHECKPOINT}" "${STAGE2_BEST_CHECKPOINT}" "${HARD_SLICE_JSON}" <<'PY'
 import csv
 import json
 import os
@@ -654,10 +705,15 @@ from pathlib import Path
     manifest,
     base_report,
     final_report,
+    stage2_report,
     vis_dir,
     log_dir,
     base_checkpoint,
     final_checkpoint,
+    final_best_checkpoint,
+    stage2_checkpoint,
+    stage2_best_checkpoint,
+    hard_slice_json,
 ) = [Path(item) for item in sys.argv[1:]]
 
 def count_rows(path: Path) -> int:
@@ -704,7 +760,13 @@ except Exception as exc:
 
 base = load_json(base_report)
 final = load_json(final_report)
+stage2 = load_json(stage2_report)
 visual_summary = load_json(vis_dir / "summary.json")
+hard_slices = load_json(hard_slice_json)
+
+selected_checkpoint = stage2_best_checkpoint if stage2_best_checkpoint.exists() else stage2_checkpoint
+if not selected_checkpoint.exists():
+    selected_checkpoint = final_best_checkpoint if final_best_checkpoint.exists() else final_checkpoint
 
 report = {
     "status": "H20_PIPELINE_DONE",
@@ -718,8 +780,14 @@ report = {
         "manifest": str(manifest),
         "base_checkpoint": str(base_checkpoint),
         "final_checkpoint": str(final_checkpoint),
+        "final_best_checkpoint": str(final_best_checkpoint),
+        "stage2_checkpoint": str(stage2_checkpoint),
+        "stage2_best_checkpoint": str(stage2_best_checkpoint),
+        "selected_checkpoint": str(selected_checkpoint),
+        "hard_slice_json": str(hard_slice_json),
         "base_report": str(base_report),
         "final_report": str(final_report),
+        "stage2_report": str(stage2_report),
         "visual_dir": str(vis_dir),
         "log_dir": str(log_dir),
     },
@@ -730,6 +798,12 @@ report = {
     },
     "base_final_eval": (base or {}).get("final_eval", {}),
     "transport_final_eval": (final or {}).get("final_eval", {}),
+    "stage2_hard_final_eval": (stage2 or {}).get("final_eval", {}),
+    "stage2_hard_best_eval": (stage2 or {}).get("best_eval", {}),
+    "hard_slices": {
+        "records": len((hard_slices or {}).get("records", [])) if isinstance(hard_slices, dict) else None,
+        "summary": (hard_slices or {}).get("summary", {}) if isinstance(hard_slices, dict) else {},
+    },
     "visual_summary": visual_summary,
 }
 report_path.parent.mkdir(parents=True, exist_ok=True)

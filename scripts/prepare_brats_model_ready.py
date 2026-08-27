@@ -29,6 +29,8 @@ class SubjectCase:
 
 def find_subjects(raw_root: Path) -> list[SubjectCase]:
     subjects: list[SubjectCase] = []
+    if not raw_root.exists():
+        return subjects
     for dataset_dir in sorted(item for item in raw_root.iterdir() if item.is_dir()):
         for subject_dir in sorted(dataset_dir.rglob("BraTS-*")):
             if not subject_dir.is_dir():
@@ -106,12 +108,28 @@ def process_subject(
     output_root: Path,
     target_shape: tuple[int, int, int],
     crop_margin: int,
+    force: bool,
 ) -> dict[str, Any]:
     output_dir = output_root / case.dataset / case.subject_id
     output_dir.mkdir(parents=True, exist_ok=True)
     multimodal_path = output_dir / "multimodal_4ch.npy"
     seg_path = output_dir / "seg.npy"
     metadata_path = output_dir / "metadata.json"
+
+    if not force and multimodal_path.exists() and seg_path.exists() and metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            metadata = {}
+        return {
+            "dataset": case.dataset,
+            "subject_id": case.subject_id,
+            "status": "processed",
+            "original_shape": "x".join(str(item) for item in metadata.get("original_shape", [])),
+            "target_shape": "x".join(str(item) for item in metadata.get("target_shape", target_shape)),
+            "multimodal_path": str(multimodal_path),
+            "seg_path": str(seg_path),
+        }
 
     image_arrays = [load_nifti(case.files[modality]) for modality in MODALITIES]
     seg_array = load_nifti(case.files["seg"])
@@ -179,6 +197,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-shape", nargs=3, type=int, default=[128, 128, 128])
     parser.add_argument("--crop-margin", type=int, default=8)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reprocess subjects even when model-ready outputs already exist.",
+    )
     return parser.parse_args()
 
 
@@ -219,7 +242,14 @@ def main() -> None:
     failed: list[dict[str, Any]] = []
     with ProcessPoolExecutor(max_workers=max(args.workers, 1)) as executor:
         futures = {
-            executor.submit(process_subject, case, output_root, target_shape, args.crop_margin): case
+            executor.submit(
+                process_subject,
+                case,
+                output_root,
+                target_shape,
+                args.crop_margin,
+                args.force,
+            ): case
             for case in subjects
         }
         for index, future in enumerate(as_completed(futures), start=1):
