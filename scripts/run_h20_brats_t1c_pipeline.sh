@@ -94,6 +94,7 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 LOG_EVERY="${LOG_EVERY:-100}"
 SEED="${SEED:-46}"
 SPLIT_SEED="${SPLIT_SEED:-4601}"
+HIDDEN_CHANNELS="${HIDDEN_CHANNELS:-32}"
 
 BASE_EPOCHS="${BASE_EPOCHS:-8}"
 BASE_MAX_TRAIN_STEPS="${BASE_MAX_TRAIN_STEPS:-0}"
@@ -139,6 +140,7 @@ STAGE2_BEST_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_be
 
 VIS_NUM_CASES="${VIS_NUM_CASES:-12}"
 VIS_CASE_SELECTION="${VIS_CASE_SELECTION:-representative}"
+VIS_CASE_SELECTIONS="${VIS_CASE_SELECTIONS:-${VIS_CASE_SELECTION}}"
 VIS_SELECTION_POOL="${VIS_SELECTION_POOL:-240}"
 VIS_SLICE_CROP_SIZE="${VIS_SLICE_CROP_SIZE:-0}"
 VIS_DIR="${VIS_DIR:-${VIS_ROOT}/${RUN_NAME}}"
@@ -362,6 +364,7 @@ train_base_if_needed() {
     --max-train-steps "${BASE_MAX_TRAIN_STEPS}"
     --batch-size "${BATCH_SIZE}"
     --num-workers "${NUM_WORKERS}"
+    --hidden-channels "${HIDDEN_CHANNELS}"
     --output-activation hardtanh
     --residual-scale 0.75
     --lesion-residual-scale 1.5
@@ -431,6 +434,7 @@ train_enhancement() {
     --max-train-steps "${MAX_TRAIN_STEPS}"
     --batch-size "${BATCH_SIZE}"
     --num-workers "${NUM_WORKERS}"
+    --hidden-channels "${HIDDEN_CHANNELS}"
     --freeze-base-generator
     --detail-only-refinement
     --output-activation hardtanh
@@ -506,6 +510,7 @@ train_transport() {
     --max-train-steps "${MAX_TRAIN_STEPS}"
     --batch-size "${BATCH_SIZE}"
     --num-workers "${NUM_WORKERS}"
+    --hidden-channels "${HIDDEN_CHANNELS}"
     --output-activation hardtanh
     --transport-steps "${TRANSPORT_STEPS}"
     --transport-step-scale "${TRANSPORT_STEP_SCALE}"
@@ -612,6 +617,7 @@ train_transport_stage2_hard() {
       --max-train-steps "${MAX_TRAIN_STEPS}" \
       --batch-size "${BATCH_SIZE}" \
       --num-workers "${NUM_WORKERS}" \
+      --hidden-channels "${HIDDEN_CHANNELS}" \
       --output-activation hardtanh \
       --transport-steps "${TRANSPORT_STEPS}" \
       --transport-step-scale "${TRANSPORT_STEP_SCALE}" \
@@ -667,19 +673,27 @@ visualize_cases() {
     echo "[ERROR] No checkpoint missing before visualization." >&2
     exit 5
   fi
-  run_stage visualize_cases \
-    python scripts/visualize_slice_virtual_modality_generation.py \
-      --manifest "${MANIFEST}" \
-      --checkpoint "${vis_checkpoint}" \
-      --device "${DEVICE}" \
-      --target-modality "${TARGET_MODALITY}" \
-      --spatial-size "${SPATIAL_SIZE}" \
-      --num-cases "${VIS_NUM_CASES}" \
-      --case-selection "${VIS_CASE_SELECTION}" \
-      --selection-pool "${VIS_SELECTION_POOL}" \
-      --slice-crop-size "${VIS_SLICE_CROP_SIZE}" \
-      --apply-brain-mask \
-      --output-dir "${VIS_DIR}"
+  read -r -a vis_selection_args <<< "${VIS_CASE_SELECTIONS}"
+  local selection_count="${#vis_selection_args[@]}"
+  for selection in "${vis_selection_args[@]}"; do
+    local output_dir="${VIS_DIR}"
+    if [[ "${selection_count}" -gt 1 ]]; then
+      output_dir="${VIS_DIR}/${selection}"
+    fi
+    run_stage "visualize_${selection}" \
+      python scripts/visualize_slice_virtual_modality_generation.py \
+        --manifest "${MANIFEST}" \
+        --checkpoint "${vis_checkpoint}" \
+        --device "${DEVICE}" \
+        --target-modality "${TARGET_MODALITY}" \
+        --spatial-size "${SPATIAL_SIZE}" \
+        --num-cases "${VIS_NUM_CASES}" \
+        --case-selection "${selection}" \
+        --selection-pool "${VIS_SELECTION_POOL}" \
+        --slice-crop-size "${VIS_SLICE_CROP_SIZE}" \
+        --apply-brain-mask \
+        --output-dir "${output_dir}"
+  done
 }
 
 write_pipeline_report() {
@@ -762,6 +776,12 @@ base = load_json(base_report)
 final = load_json(final_report)
 stage2 = load_json(stage2_report)
 visual_summary = load_json(vis_dir / "summary.json")
+visual_summaries = {}
+if visual_summary is None and vis_dir.exists():
+    for child in sorted(item for item in vis_dir.iterdir() if item.is_dir()):
+        child_summary = load_json(child / "summary.json")
+        if child_summary is not None:
+            visual_summaries[child.name] = child_summary
 hard_slices = load_json(hard_slice_json)
 
 selected_checkpoint = stage2_best_checkpoint if stage2_best_checkpoint.exists() else stage2_checkpoint
@@ -805,6 +825,7 @@ report = {
         "summary": (hard_slices or {}).get("summary", {}) if isinstance(hard_slices, dict) else {},
     },
     "visual_summary": visual_summary,
+    "visual_summaries": visual_summaries,
 }
 report_path.parent.mkdir(parents=True, exist_ok=True)
 report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")

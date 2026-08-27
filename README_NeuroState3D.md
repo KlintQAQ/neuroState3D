@@ -324,3 +324,16 @@ The script is resumable:
 - Existing checkpoints/reports are skipped unless `FORCE_FINETUNE=1`.
 - Runtime artifacts stay under ignored folders such as `data/`, `outputs/`,
   and `reports/`; they should not be committed.
+
+For the current best-effect experiment preset, use the stronger wrapper:
+
+```bash
+bash scripts/run_h20_best_t1c_experiment.sh
+```
+
+This wrapper keeps the same end-to-end pipeline but raises the training budget
+and capacity for H20: full subject usage, no max-step cap, 64 hidden channels,
+8 transport steps, 48 slices per subject, 16 base epochs, 10 hard-case stage-2
+epochs, hard-slice mining, and representative/best/worst visual reports. It is
+the intended command when the goal is to push the current method line as hard as
+the H20 job budget allows.
