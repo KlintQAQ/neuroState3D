@@ -87,6 +87,7 @@ SPATIAL_SIZE="${SPATIAL_SIZE:-128}"
 MAX_SUBJECTS="${MAX_SUBJECTS:-0}"          # 0 means all subjects in the training script.
 VAL_SUBJECTS="${VAL_SUBJECTS:-128}"
 SLICES_PER_SUBJECT="${SLICES_PER_SUBJECT:-32}"
+SLICE_CONTEXT_RADIUS="${SLICE_CONTEXT_RADIUS:-0}"
 SLICE_CROP_SIZE="${SLICE_CROP_SIZE:-64}"
 SLICE_CROP_JITTER="${SLICE_CROP_JITTER:-6}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
@@ -133,18 +134,44 @@ MINE_MAX_SUBJECTS="${MINE_MAX_SUBJECTS:-0}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-6}"
 STAGE2_LR="${STAGE2_LR:-5e-5}"
 STAGE2_SLICE_CROP_SIZE="${STAGE2_SLICE_CROP_SIZE:-96}"
-STAGE2_OUTPUT_DIR="${STAGE2_OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}_transport_stage2_hard}"
-STAGE2_REPORT="${STAGE2_REPORT:-${REPORT_DIR}/${RUN_NAME}_transport_stage2_hard.json}"
+STAGE2_BEST_METRIC="${STAGE2_BEST_METRIC:-lesion_composite}"
+STAGE2_OUTPUT_DIR="${STAGE2_OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}_transport_stage2_noharm}"
+STAGE2_REPORT="${STAGE2_REPORT:-${REPORT_DIR}/${RUN_NAME}_transport_stage2_noharm.json}"
 STAGE2_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_last.pt"
 STAGE2_BEST_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_best.pt"
 STAGE2_GATED_REFINEMENT="${STAGE2_GATED_REFINEMENT:-1}"
 STAGE2_FREEZE_TRANSPORT_BASE="${STAGE2_FREEZE_TRANSPORT_BASE:-1}"
-REFINEMENT_RESIDUAL_SCALE="${REFINEMENT_RESIDUAL_SCALE:-0.25}"
+STAGE2_REFINEMENT_ACCEPTANCE_GATE="${STAGE2_REFINEMENT_ACCEPTANCE_GATE:-1}"
+STAGE2_REFINEMENT_CHANNELS_MULTIPLIER="${STAGE2_REFINEMENT_CHANNELS_MULTIPLIER:-2}"
+STAGE2_REFINEMENT_BLOCKS="${STAGE2_REFINEMENT_BLOCKS:-4}"
+REFINEMENT_RESIDUAL_SCALE="${REFINEMENT_RESIDUAL_SCALE:-0.18}"
 GATE_BIAS_INIT="${GATE_BIAS_INIT:--3.0}"
+ACCEPT_BIAS_INIT="${ACCEPT_BIAS_INIT:--2.0}"
 GATE_SUPERVISION_WEIGHT="${GATE_SUPERVISION_WEIGHT:-0.60}"
 GATE_SPARSITY_WEIGHT="${GATE_SPARSITY_WEIGHT:-0.08}"
 BACKGROUND_PRESERVE_WEIGHT="${BACKGROUND_PRESERVE_WEIGHT:-0.60}"
 CORE_OVERFILL_WEIGHT="${CORE_OVERFILL_WEIGHT:-0.25}"
+MULTISCALE_SSIM_WEIGHT="${MULTISCALE_SSIM_WEIGHT:-0.04}"
+LESION_MULTISCALE_SSIM_WEIGHT="${LESION_MULTISCALE_SSIM_WEIGHT:-0.12}"
+LAPLACIAN_PYRAMID_WEIGHT="${LAPLACIAN_PYRAMID_WEIGHT:-0.05}"
+LESION_LAPLACIAN_PYRAMID_WEIGHT="${LESION_LAPLACIAN_PYRAMID_WEIGHT:-0.16}"
+FIDELITY_PYRAMID_LEVELS="${FIDELITY_PYRAMID_LEVELS:-3}"
+MICRO_WINDOW_FEATURE_WEIGHT="${MICRO_WINDOW_FEATURE_WEIGHT:-0.14}"
+MICRO_WINDOW_DRIFT_WEIGHT="${MICRO_WINDOW_DRIFT_WEIGHT:-0.006}"
+MICRO_WINDOW_DRIFT_RADII="${MICRO_WINDOW_DRIFT_RADII:-0.006 0.015 0.04}"
+MICRO_WINDOW_DRIFT_MAX_TOKENS="${MICRO_WINDOW_DRIFT_MAX_TOKENS:-256}"
+MICRO_WINDOW_SIZES="${MICRO_WINDOW_SIZES:-3 5 7}"
+MICRO_WINDOW_STRIDE="${MICRO_WINDOW_STRIDE:-2}"
+ACCEPTANCE_SUPERVISION_WEIGHT="${ACCEPTANCE_SUPERVISION_WEIGHT:-0.25}"
+ACCEPTANCE_ERROR_THRESHOLD="${ACCEPTANCE_ERROR_THRESHOLD:-0.04}"
+REFINEMENT_RESIDUAL_TARGET_WEIGHT="${REFINEMENT_RESIDUAL_TARGET_WEIGHT:-0.25}"
+REFINEMENT_DIRECTION_WEIGHT="${REFINEMENT_DIRECTION_WEIGHT:-0.08}"
+REFINEMENT_RESIDUAL_BUDGET_WEIGHT="${REFINEMENT_RESIDUAL_BUDGET_WEIGHT:-0.35}"
+REFINEMENT_LESION_BUDGET_WEIGHT="${REFINEMENT_LESION_BUDGET_WEIGHT:-0.55}"
+REFINEMENT_NO_HARM_WEIGHT="${REFINEMENT_NO_HARM_WEIGHT:-0.40}"
+REFINEMENT_LESION_NO_HARM_WEIGHT="${REFINEMENT_LESION_NO_HARM_WEIGHT:-0.80}"
+REFINEMENT_BACKGROUND_NO_HARM_WEIGHT="${REFINEMENT_BACKGROUND_NO_HARM_WEIGHT:-0.30}"
+REFINEMENT_NO_HARM_MARGIN="${REFINEMENT_NO_HARM_MARGIN:-0.0}"
 GATE_TARGET_DILATION="${GATE_TARGET_DILATION:-2}"
 
 VIS_NUM_CASES="${VIS_NUM_CASES:-12}"
@@ -366,6 +393,7 @@ train_base_if_needed() {
     --max-subjects "${MAX_SUBJECTS}"
     --val-subjects "${VAL_SUBJECTS}"
     --slices-per-subject "${SLICES_PER_SUBJECT}"
+    --slice-context-radius "${SLICE_CONTEXT_RADIUS}"
     --slice-crop-size "${SLICE_CROP_SIZE}"
     --slice-crop-jitter "${SLICE_CROP_JITTER}"
     --slice-crop-mode region_balanced
@@ -436,6 +464,7 @@ train_enhancement() {
     --max-subjects "${MAX_SUBJECTS}"
     --val-subjects "${VAL_SUBJECTS}"
     --slices-per-subject "${SLICES_PER_SUBJECT}"
+    --slice-context-radius "${SLICE_CONTEXT_RADIUS}"
     --slice-crop-size "${SLICE_CROP_SIZE}"
     --slice-crop-jitter "${SLICE_CROP_JITTER}"
     --slice-crop-mode region_balanced
@@ -512,6 +541,7 @@ train_transport() {
     --max-subjects "${MAX_SUBJECTS}"
     --val-subjects "${VAL_SUBJECTS}"
     --slices-per-subject "${SLICES_PER_SUBJECT}"
+    --slice-context-radius "${SLICE_CONTEXT_RADIUS}"
     --slice-crop-size "${SLICE_CROP_SIZE}"
     --slice-crop-jitter "${SLICE_CROP_JITTER}"
     --slice-crop-mode region_balanced
@@ -589,9 +619,9 @@ mine_hard_slices() {
       --output-json "${HARD_SLICE_JSON}"
 }
 
-train_transport_stage2_hard() {
+train_transport_stage2_noharm() {
   if [[ "${TRAIN_STAGE2_HARD}" != "1" ]]; then
-    stage_log "TRAIN_STAGE2_HARD=0; skipping hard-case transport fine-tune."
+    stage_log "TRAIN_STAGE2_HARD=0; skipping no-harm stage-2 transport fine-tune."
     return
   fi
   local source_checkpoint="${FINAL_BEST_CHECKPOINT}"
@@ -603,7 +633,7 @@ train_transport_stage2_hard() {
     exit 7
   fi
   if [[ "${FORCE_FINETUNE}" != "1" && -f "${STAGE2_CHECKPOINT}" && -f "${STAGE2_REPORT}" ]]; then
-    stage_log "Stage-2 checkpoint/report exist; skipping hard fine-tune."
+    stage_log "Stage-2 checkpoint/report exist; skipping no-harm fine-tune."
     return
   fi
   local stage2_extra_args=()
@@ -611,27 +641,44 @@ train_transport_stage2_hard() {
     stage2_extra_args+=(
       --gated-refinement
       --refinement-residual-scale "${REFINEMENT_RESIDUAL_SCALE}"
+      --refinement-channels-multiplier "${STAGE2_REFINEMENT_CHANNELS_MULTIPLIER}"
+      --refinement-blocks "${STAGE2_REFINEMENT_BLOCKS}"
       --gate-bias-init "${GATE_BIAS_INIT}"
       --gate-supervision-weight "${GATE_SUPERVISION_WEIGHT}"
       --gate-sparsity-weight "${GATE_SPARSITY_WEIGHT}"
       --background-preserve-weight "${BACKGROUND_PRESERVE_WEIGHT}"
       --core-overfill-weight "${CORE_OVERFILL_WEIGHT}"
       --gate-target-dilation "${GATE_TARGET_DILATION}"
+      --acceptance-supervision-weight "${ACCEPTANCE_SUPERVISION_WEIGHT}"
+      --acceptance-error-threshold "${ACCEPTANCE_ERROR_THRESHOLD}"
+      --refinement-residual-target-weight "${REFINEMENT_RESIDUAL_TARGET_WEIGHT}"
+      --refinement-direction-weight "${REFINEMENT_DIRECTION_WEIGHT}"
+      --refinement-residual-budget-weight "${REFINEMENT_RESIDUAL_BUDGET_WEIGHT}"
+      --refinement-lesion-budget-weight "${REFINEMENT_LESION_BUDGET_WEIGHT}"
+      --refinement-no-harm-weight "${REFINEMENT_NO_HARM_WEIGHT}"
+      --refinement-lesion-no-harm-weight "${REFINEMENT_LESION_NO_HARM_WEIGHT}"
+      --refinement-background-no-harm-weight "${REFINEMENT_BACKGROUND_NO_HARM_WEIGHT}"
+      --refinement-no-harm-margin "${REFINEMENT_NO_HARM_MARGIN}"
     )
+    if [[ "${STAGE2_REFINEMENT_ACCEPTANCE_GATE}" == "1" ]]; then
+      stage2_extra_args+=(--refinement-acceptance-gate --accept-bias-init "${ACCEPT_BIAS_INIT}")
+    fi
     if [[ "${STAGE2_FREEZE_TRANSPORT_BASE}" == "1" ]]; then
       stage2_extra_args+=(--freeze-base-generator)
     fi
   fi
-  run_stage train_transport_stage2_hard \
+  run_stage train_transport_stage2_noharm \
     python scripts/train_slice_virtual_modality_drifting.py \
       --manifest "${MANIFEST}" \
       --device "${DEVICE}" \
       --model-kind transport \
+      --best-metric "${STAGE2_BEST_METRIC}" \
       --target-modality "${TARGET_MODALITY}" \
       --spatial-size "${SPATIAL_SIZE}" \
       --max-subjects "${MAX_SUBJECTS}" \
       --val-subjects "${VAL_SUBJECTS}" \
       --slices-per-subject "${SLICES_PER_SUBJECT}" \
+      --slice-context-radius "${SLICE_CONTEXT_RADIUS}" \
       --slice-crop-size "${STAGE2_SLICE_CROP_SIZE}" \
       --slice-crop-jitter "${SLICE_CROP_JITTER}" \
       --slice-crop-mode region_balanced \
@@ -656,8 +703,19 @@ train_transport_stage2_hard() {
       --recon-weight 1.0 \
       --nll-weight 0.02 \
       --gradient-weight 0.12 \
+      --multiscale-ssim-weight "${MULTISCALE_SSIM_WEIGHT}" \
+      --lesion-multiscale-ssim-weight "${LESION_MULTISCALE_SSIM_WEIGHT}" \
+      --laplacian-pyramid-weight "${LAPLACIAN_PYRAMID_WEIGHT}" \
+      --lesion-laplacian-pyramid-weight "${LESION_LAPLACIAN_PYRAMID_WEIGHT}" \
+      --fidelity-pyramid-levels "${FIDELITY_PYRAMID_LEVELS}" \
       --drift-weight 0.0 \
       --window-feature-weight 0.05 \
+      --micro-window-feature-weight "${MICRO_WINDOW_FEATURE_WEIGHT}" \
+      --micro-window-drift-weight "${MICRO_WINDOW_DRIFT_WEIGHT}" \
+      --micro-window-drift-radii ${MICRO_WINDOW_DRIFT_RADII} \
+      --micro-window-drift-max-tokens "${MICRO_WINDOW_DRIFT_MAX_TOKENS}" \
+      --micro-window-sizes ${MICRO_WINDOW_SIZES} \
+      --micro-window-stride "${MICRO_WINDOW_STRIDE}" \
       --medical-drift-weight 0.003 \
       --medical-drift-memory-tokens 64 \
       --medical-drift-max-current-tokens 192 \
@@ -844,8 +902,8 @@ report = {
     },
     "base_final_eval": (base or {}).get("final_eval", {}),
     "transport_final_eval": (final or {}).get("final_eval", {}),
-    "stage2_hard_final_eval": (stage2 or {}).get("final_eval", {}),
-    "stage2_hard_best_eval": (stage2 or {}).get("best_eval", {}),
+    "stage2_noharm_final_eval": (stage2 or {}).get("final_eval", {}),
+    "stage2_noharm_best_eval": (stage2 or {}).get("best_eval", {}),
     "hard_slices": {
         "records": len((hard_slices or {}).get("records", [])) if isinstance(hard_slices, dict) else None,
         "summary": (hard_slices or {}).get("summary", {}) if isinstance(hard_slices, dict) else {},
@@ -873,7 +931,7 @@ main() {
   fi
   train_transport
   mine_hard_slices
-  train_transport_stage2_hard
+  train_transport_stage2_noharm
   visualize_cases
   write_pipeline_report
   stage_log "ALL DONE"

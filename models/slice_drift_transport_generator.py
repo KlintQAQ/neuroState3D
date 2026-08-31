@@ -24,6 +24,10 @@ class SliceDriftTransportGeneratorConfig:
     gated_refinement: bool = False
     refinement_residual_scale: float = 0.25
     gate_bias_init: float = -3.0
+    refinement_acceptance_gate: bool = False
+    accept_bias_init: float = -2.0
+    refinement_channels_multiplier: int = 1
+    refinement_blocks: int = 1
 
 
 class SliceDriftTransportGenerator(nn.Module):
@@ -79,15 +83,30 @@ class SliceDriftTransportGenerator(nn.Module):
         nn.init.zeros_(self.velocity_head.bias)
         if self.config.gated_refinement:
             refinement_in_channels = int(self.config.in_modalities) * 2 + 3 + class_channels
+            refinement_hidden = hidden * max(1, int(self.config.refinement_channels_multiplier))
+            refinement_blocks = max(1, int(self.config.refinement_blocks))
+            refinement_layers: list[nn.Module] = [ConvNormAct2d(refinement_in_channels, refinement_hidden)]
+            refinement_layers.extend(ResidualConvBlock2d(refinement_hidden) for _ in range(refinement_blocks))
+            refinement_layers.append(ConvNormAct2d(refinement_hidden, refinement_hidden))
             self.refinement_context = nn.Sequential(
-                ConvNormAct2d(refinement_in_channels, hidden),
-                ResidualConvBlock2d(hidden),
-                ConvNormAct2d(hidden, hidden),
+                *refinement_layers,
             )
-            self.refinement_gate_head = nn.Conv2d(hidden, 1, kernel_size=1)
-            self.refinement_residual_head = nn.Conv2d(hidden, 1, kernel_size=1)
+            self.refinement_feature_project = (
+                nn.Identity()
+                if refinement_hidden == hidden
+                else nn.Sequential(
+                    nn.Conv2d(hidden, refinement_hidden, kernel_size=1),
+                    nn.GroupNorm(_group_count(refinement_hidden), refinement_hidden),
+                    nn.GELU(),
+                )
+            )
+            self.refinement_gate_head = nn.Conv2d(refinement_hidden, 1, kernel_size=1)
+            self.refinement_residual_head = nn.Conv2d(refinement_hidden, 1, kernel_size=1)
             nn.init.constant_(self.refinement_gate_head.bias, float(self.config.gate_bias_init))
             nn.init.zeros_(self.refinement_residual_head.bias)
+            if self.config.refinement_acceptance_gate:
+                self.refinement_accept_head = nn.Conv2d(refinement_hidden, 1, kernel_size=1)
+                nn.init.constant_(self.refinement_accept_head.bias, float(self.config.accept_bias_init))
 
     def forward(
         self,
@@ -136,6 +155,9 @@ class SliceDriftTransportGenerator(nn.Module):
         refinement_gate = None
         refinement_gate_logits = None
         refinement_residual = None
+        refinement_region_gate = None
+        refinement_acceptance = None
+        refinement_acceptance_logits = None
         if self.config.gated_refinement:
             if last_features is None:
                 raise RuntimeError("gated_refinement requires at least one transport step")
@@ -151,12 +173,17 @@ class SliceDriftTransportGenerator(nn.Module):
             if class_map is not None:
                 refinement_inputs.append(class_map)
             refinement_features = self.refinement_context(torch.cat(refinement_inputs, dim=1))
-            refinement_features = refinement_features + last_features
+            refinement_features = refinement_features + self.refinement_feature_project(last_features)
             refinement_gate_logits = self.refinement_gate_head(refinement_features)
-            refinement_gate = torch.sigmoid(refinement_gate_logits)
+            refinement_region_gate = torch.sigmoid(refinement_gate_logits)
             refinement_residual = float(self.config.refinement_residual_scale) * torch.tanh(
                 self.refinement_residual_head(refinement_features)
             )
+            refinement_gate = refinement_region_gate
+            if self.config.refinement_acceptance_gate:
+                refinement_acceptance_logits = self.refinement_accept_head(refinement_features)
+                refinement_acceptance = torch.sigmoid(refinement_acceptance_logits)
+                refinement_gate = refinement_region_gate * refinement_acceptance
             current = self._activate(stage1 + refinement_gate * refinement_residual)
         uncertainty = F.softplus(uncertainty_raw) + float(self.config.uncertainty_min)
         confidence = torch.exp(-uncertainty)
@@ -179,7 +206,15 @@ class SliceDriftTransportGenerator(nn.Module):
                 {
                     "refinement_gate": refinement_gate,
                     "refinement_gate_logits": refinement_gate_logits,
+                    "refinement_region_gate": refinement_region_gate,
                     "refinement_residual": refinement_residual,
+                }
+            )
+        if refinement_acceptance is not None:
+            output.update(
+                {
+                    "refinement_acceptance": refinement_acceptance,
+                    "refinement_acceptance_logits": refinement_acceptance_logits,
                 }
             )
         return output

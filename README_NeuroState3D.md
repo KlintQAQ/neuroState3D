@@ -305,8 +305,8 @@ By default it runs inside the current project folder, creates or reuses a
 `neurostate3d` conda environment, installs missing dependencies only, downloads
 BraTS GLI/MEN/PED from Hugging Face, incrementally prepares model-ready arrays,
 trains the drift-transport generator, mines hard lesion slices, runs stage-2
-hard-case fine-tuning, generates visual cases, and writes a JSON pipeline
-summary.
+no-harm pixel-fidelity fine-tuning, generates visual cases, and writes a JSON
+pipeline summary.
 
 Useful H20 overrides:
 
@@ -333,11 +333,20 @@ bash scripts/run_h20_best_t1c_experiment.sh
 
 This wrapper keeps the same end-to-end pipeline but raises the training budget
 and capacity for H20: full subject usage, no max-step cap, 64 hidden channels,
-8 transport steps, 48 slices per subject, 16 base epochs, 10 hard-case stage-2
-epochs, hard-slice mining, lesion-gated refinement, background-preservation
-losses, anti-overfill losses, and representative/best/worst visual reports. The
-stage-2 refinement gate uses a lightweight convolutional context head over the
-observed modalities, the stage-1 synthetic T1c, and uncertainty, so refinement
-can focus on lesion regions without retraining the full transport backbone. It
-is the intended command when the goal is to push the current method line as hard
-as the H20 job budget allows.
+8 transport steps, 2.5D slice context by default, 48 slices per subject, 16 base
+epochs, 10 no-harm stage-2 epochs over mined hard slices, lesion-gated no-harm
+refinement, background-preservation losses, anti-overfill losses, and
+representative/best/worst visual reports. The stage-2 refinement is no longer a
+tiny correction head: by default it uses a 2x wider, 4-block convolutional
+context refiner over the observed modalities, the stage-1 synthetic T1c, and
+uncertainty. It predicts a lesion-region gate, an acceptance gate, and a bounded
+residual so the final image can fall back to stage-1 where refinement is not
+expected to help. Pixel fidelity is explicitly trained with micro-window
+3/5/7-pixel medical feature alignment, micro-window drifting over the same
+local feature tokens, multi-scale SSIM, and Laplacian pyramid detail losses,
+while the no-harm losses penalize refined pixels that are worse than the frozen
+stage-1 transport output. Stage-2 best-checkpoint selection defaults to a lesion
+composite score instead of whole-image MAE, so the selected model favors
+high-tumor, ET/TC, under-enhancement, structural fidelity, and no-harm behavior.
+It is the intended command when the goal is to push the current drifting method
+line as hard as the H20 job budget allows.

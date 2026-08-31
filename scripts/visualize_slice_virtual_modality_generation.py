@@ -127,6 +127,12 @@ def load_model(
                 gated_refinement=bool(config.get("gated_refinement", False)),
                 refinement_residual_scale=float(config.get("refinement_residual_scale", 0.25)),
                 gate_bias_init=float(config.get("gate_bias_init", -3.0)),
+                refinement_acceptance_gate=bool(config.get("refinement_acceptance_gate", False)),
+                accept_bias_init=float(config.get("accept_bias_init", -2.0)),
+                refinement_channels_multiplier=int(
+                    config.get("refinement_channels_multiplier", 1)
+                ),
+                refinement_blocks=int(config.get("refinement_blocks", 1)),
             )
         )
     else:
@@ -230,6 +236,7 @@ def generate_volume(
     np.ndarray,
     np.ndarray | None,
     np.ndarray | None,
+    np.ndarray | None,
     np.ndarray,
 ]:
     device = next(model.parameters()).device
@@ -247,6 +254,7 @@ def generate_volume(
     uncertainty_slices = []
     prompt_slices = []
     gate_slices = []
+    acceptance_slices = []
     stage1_slices = []
     for start in range(0, width, int(batch_slices)):
         end = min(start + int(batch_slices), width)
@@ -266,6 +274,8 @@ def generate_volume(
             prompt_slices.append(output["prompt_probs"].cpu())
         if "refinement_gate" in output:
             gate_slices.append(output["refinement_gate"].squeeze(1).cpu())
+        if "refinement_acceptance" in output:
+            acceptance_slices.append(output["refinement_acceptance"].squeeze(1).cpu())
     synthetic = torch.cat(synthetic_slices, dim=0).numpy().transpose(1, 2, 0)
     confidence = torch.cat(confidence_slices, dim=0).numpy().transpose(1, 2, 0)
     uncertainty = torch.cat(uncertainty_slices, dim=0).numpy().transpose(1, 2, 0)
@@ -275,8 +285,11 @@ def generate_volume(
     gate = None
     if gate_slices:
         gate = torch.cat(gate_slices, dim=0).numpy().transpose(1, 2, 0)
+    acceptance = None
+    if acceptance_slices:
+        acceptance = torch.cat(acceptance_slices, dim=0).numpy().transpose(1, 2, 0)
     stage1 = torch.cat(stage1_slices, dim=0).numpy().transpose(1, 2, 0)
-    return synthetic, confidence, uncertainty, prompt, gate, stage1
+    return synthetic, confidence, uncertainty, prompt, gate, acceptance, stage1
 
 
 def robust_limits(array: np.ndarray) -> tuple[float, float]:
@@ -352,7 +365,15 @@ def generate_slice(
     image_slice: torch.Tensor,
     base_target_index: int,
     dataset_name: str = "",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray,
+]:
     device = next(model.parameters()).device
     image_slice = torch.nan_to_num(
         image_slice.to(device),
@@ -377,9 +398,13 @@ def generate_slice(
     prompt_np = prompt.squeeze(0).cpu().numpy() if prompt is not None else None
     gate = output.get("refinement_gate")
     gate_np = gate.squeeze(0).squeeze(0).cpu().numpy() if gate is not None else None
+    acceptance = output.get("refinement_acceptance")
+    acceptance_np = (
+        acceptance.squeeze(0).squeeze(0).cpu().numpy() if acceptance is not None else None
+    )
     stage1 = output.get("stage1_synthetic", output["synthetic"])
     stage1_np = stage1.squeeze(0).squeeze(0).cpu().numpy()
-    return synthetic, confidence, uncertainty, prompt_np, gate_np, stage1_np
+    return synthetic, confidence, uncertainty, prompt_np, gate_np, acceptance_np, stage1_np
 
 
 def show_slice(
@@ -461,7 +486,7 @@ def choose_cases_by_generation_error(
             real = image_np[target_index]
             z = selected_slice(seg_np, real)
             context_tensor = context_slice_tensor(image_np, z, context_radius)
-            synthetic, _, _, _, _, _ = generate_slice(
+            synthetic, _, _, _, _, _, _ = generate_slice(
                 model,
                 context_tensor,
                 target_index,
@@ -552,7 +577,15 @@ def main() -> int:
                 crop_seg = crop_seg_tensor.numpy()
             else:
                 crop_seg = crop_seg.astype(np.int64, copy=False)
-            synthetic_2d, confidence_2d, uncertainty_2d, prompt_2d, gate_2d, stage1_2d = generate_slice(
+            (
+                synthetic_2d,
+                confidence_2d,
+                uncertainty_2d,
+                prompt_2d,
+                gate_2d,
+                acceptance_2d,
+                stage1_2d,
+            ) = generate_slice(
                 model,
                 crop_tensor,
                 target_index,
@@ -566,10 +599,11 @@ def main() -> int:
             uncertainty = uncertainty_2d[:, :, None]
             prompt = prompt_2d[:, :, :, None] if prompt_2d is not None else None
             gate = gate_2d[:, :, None] if gate_2d is not None else None
+            acceptance = acceptance_2d[:, :, None] if acceptance_2d is not None else None
             stage1 = stage1_2d[:, :, None]
             z = 0
         else:
-            synthetic, confidence, uncertainty, prompt, gate, stage1 = generate_volume(
+            synthetic, confidence, uncertainty, prompt, gate, acceptance, stage1 = generate_volume(
                 model,
                 image,
                 target_index,
@@ -590,6 +624,8 @@ def main() -> int:
                     prompt = prompt * support[None].astype(np.float32)
                 if gate is not None:
                     gate = gate * support.astype(np.float32)
+                if acceptance is not None:
+                    acceptance = acceptance * support.astype(np.float32)
             if prompt is not None:
                 prompt = prompt
         error = np.abs(synthetic - real)
@@ -611,6 +647,8 @@ def main() -> int:
         }
         if gate is not None:
             record["gate_mean"] = float(gate.mean())
+        if acceptance is not None:
+            record["acceptance_mean"] = float(acceptance.mean())
         if crop_record is not None:
             record["crop_top"] = int(crop_record[0])
             record["crop_left"] = int(crop_record[1])
@@ -650,6 +688,8 @@ def main() -> int:
         ]
         if gate is not None:
             panels.append(("Refinement gate", gate, "viridis", 0.0, 1.0))
+        if acceptance is not None:
+            panels.append(("Acceptance gate", acceptance, "viridis", 0.0, 1.0))
         if prompt is not None:
             panels.extend(
                 [

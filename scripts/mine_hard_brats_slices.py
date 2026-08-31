@@ -185,7 +185,7 @@ def main() -> int:
         subject_records = []
         for z in candidate_slices(seg_np, int(args.candidate_slices_per_subject)):
             context_tensor = context_slice_tensor(image_np, z, context_radius)
-            synthetic, _, _, _, _, _ = generate_slice(
+            synthetic, _, _, _, _, _, _ = generate_slice(
                 model,
                 context_tensor,
                 target_index,

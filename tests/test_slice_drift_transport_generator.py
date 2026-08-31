@@ -44,6 +44,9 @@ def test_gated_refinement_preserves_stage1_shapes() -> None:
             transport_steps=2,
             gated_refinement=True,
             refinement_residual_scale=0.3,
+            refinement_acceptance_gate=True,
+            refinement_channels_multiplier=2,
+            refinement_blocks=2,
         )
     )
     image = torch.randn(2, 4, 20, 20)
@@ -55,10 +58,15 @@ def test_gated_refinement_preserves_stage1_shapes() -> None:
     assert output["stage1_synthetic"].shape == (2, 1, 20, 20)
     assert output["refinement_gate"].shape == (2, 1, 20, 20)
     assert output["refinement_gate_logits"].shape == (2, 1, 20, 20)
+    assert output["refinement_region_gate"].shape == (2, 1, 20, 20)
+    assert output["refinement_acceptance"].shape == (2, 1, 20, 20)
+    assert output["refinement_acceptance_logits"].shape == (2, 1, 20, 20)
     assert output["refinement_residual"].shape == (2, 1, 20, 20)
     assert output["synthetic"].shape == (2, 1, 20, 20)
     assert output["refinement_gate"].min() >= 0.0
     assert output["refinement_gate"].max() <= 1.0
+    assert output["refinement_acceptance"].min() >= 0.0
+    assert output["refinement_acceptance"].max() <= 1.0
 
 
 def test_transport_losses_backpropagate_to_velocity_head() -> None:

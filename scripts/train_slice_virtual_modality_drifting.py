@@ -77,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--model-kind", default="slice", choices=("slice", "prompted", "transport"))
+    parser.add_argument("--best-metric", default="mae", choices=("mae", "lesion_composite"))
     parser.add_argument("--freeze-base-generator", action="store_true")
     parser.add_argument("--detail-only-refinement", action="store_true")
     parser.add_argument("--train-prompt-with-detail", action="store_true")
@@ -91,11 +92,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gated-refinement", action="store_true")
     parser.add_argument("--refinement-residual-scale", type=float, default=0.25)
     parser.add_argument("--gate-bias-init", type=float, default=-3.0)
+    parser.add_argument("--refinement-acceptance-gate", action="store_true")
+    parser.add_argument("--accept-bias-init", type=float, default=-2.0)
+    parser.add_argument("--refinement-channels-multiplier", type=int, default=1)
+    parser.add_argument("--refinement-blocks", type=int, default=1)
     parser.add_argument("--gate-supervision-weight", type=float, default=0.0)
     parser.add_argument("--gate-target-dilation", type=int, default=2)
     parser.add_argument("--gate-sparsity-weight", type=float, default=0.0)
     parser.add_argument("--background-preserve-weight", type=float, default=0.0)
     parser.add_argument("--core-overfill-weight", type=float, default=0.0)
+    parser.add_argument("--acceptance-supervision-weight", type=float, default=0.0)
+    parser.add_argument("--acceptance-error-threshold", type=float, default=0.04)
+    parser.add_argument("--refinement-residual-target-weight", type=float, default=0.0)
+    parser.add_argument("--refinement-direction-weight", type=float, default=0.0)
+    parser.add_argument("--refinement-residual-budget-weight", type=float, default=0.0)
+    parser.add_argument("--refinement-lesion-budget-weight", type=float, default=0.0)
+    parser.add_argument("--refinement-no-harm-weight", type=float, default=0.0)
+    parser.add_argument("--refinement-lesion-no-harm-weight", type=float, default=0.0)
+    parser.add_argument("--refinement-background-no-harm-weight", type=float, default=0.0)
+    parser.add_argument("--refinement-no-harm-margin", type=float, default=0.0)
     parser.add_argument("--residual-scale", type=float, default=0.35)
     parser.add_argument("--lesion-residual-scale", type=float, default=0.45)
     parser.add_argument("--detail-residual-scale", type=float, default=0.20)
@@ -112,6 +127,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recon-weight", type=float, default=1.0)
     parser.add_argument("--nll-weight", type=float, default=0.04)
     parser.add_argument("--gradient-weight", type=float, default=0.12)
+    parser.add_argument("--multiscale-ssim-weight", type=float, default=0.0)
+    parser.add_argument("--lesion-multiscale-ssim-weight", type=float, default=0.0)
+    parser.add_argument("--laplacian-pyramid-weight", type=float, default=0.0)
+    parser.add_argument("--lesion-laplacian-pyramid-weight", type=float, default=0.0)
+    parser.add_argument("--fidelity-pyramid-levels", type=int, default=3)
     parser.add_argument("--drift-weight", type=float, default=0.12)
     parser.add_argument("--drift-patch-size", type=int, default=4)
     parser.add_argument("--drift-radii", nargs="+", type=float, default=[0.2, 0.05, 0.02])
@@ -121,6 +141,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-stride", type=int, default=8)
     parser.add_argument("--window-drift-radii", nargs="+", type=float, default=[0.004, 0.01, 0.04])
     parser.add_argument("--window-token-clamp", type=float, default=4.0)
+    parser.add_argument("--micro-window-feature-weight", type=float, default=0.0)
+    parser.add_argument("--micro-window-drift-weight", type=float, default=0.0)
+    parser.add_argument("--micro-window-drift-radii", nargs="+", type=float, default=[0.006, 0.015, 0.04])
+    parser.add_argument("--micro-window-drift-max-tokens", type=int, default=256)
+    parser.add_argument("--micro-window-sizes", nargs="+", type=int, default=[3, 5, 7])
+    parser.add_argument("--micro-window-stride", type=int, default=2)
     parser.add_argument("--medical-drift-weight", type=float, default=0.0)
     parser.add_argument("--medical-drift-window-sizes", nargs="+", type=int, default=[4, 8, 16])
     parser.add_argument("--medical-drift-radii", nargs="+", type=float, default=[0.02, 0.05, 0.2])
@@ -594,6 +620,137 @@ def edge_magnitude_2d(image: torch.Tensor) -> torch.Tensor:
     return (dx.square() + dy.square() + 1e-8).sqrt()
 
 
+def ssim_map_2d(
+    synthetic: torch.Tensor,
+    target: torch.Tensor,
+    window_size: int = 7,
+    data_range: float = 2.0,
+) -> torch.Tensor:
+    window_size = max(3, int(window_size) | 1)
+    padding = window_size // 2
+    c1 = (0.01 * float(data_range)) ** 2
+    c2 = (0.03 * float(data_range)) ** 2
+    mu_x = F.avg_pool2d(
+        synthetic,
+        kernel_size=window_size,
+        stride=1,
+        padding=padding,
+        count_include_pad=False,
+    )
+    mu_y = F.avg_pool2d(
+        target,
+        kernel_size=window_size,
+        stride=1,
+        padding=padding,
+        count_include_pad=False,
+    )
+    mu_x2 = mu_x.square()
+    mu_y2 = mu_y.square()
+    sigma_x = F.avg_pool2d(
+        synthetic.square(),
+        kernel_size=window_size,
+        stride=1,
+        padding=padding,
+        count_include_pad=False,
+    ) - mu_x2
+    sigma_y = F.avg_pool2d(
+        target.square(),
+        kernel_size=window_size,
+        stride=1,
+        padding=padding,
+        count_include_pad=False,
+    ) - mu_y2
+    sigma_xy = F.avg_pool2d(
+        synthetic * target,
+        kernel_size=window_size,
+        stride=1,
+        padding=padding,
+        count_include_pad=False,
+    ) - mu_x * mu_y
+    numerator = (2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)
+    denominator = (mu_x2 + mu_y2 + c1) * (sigma_x + sigma_y + c2)
+    return numerator / denominator.clamp_min(1e-8)
+
+
+def multiscale_ssim_loss(
+    synthetic: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+    levels: int,
+) -> torch.Tensor:
+    losses = []
+    current_synthetic = synthetic
+    current_target = target
+    current_weight = weight.to(device=synthetic.device, dtype=synthetic.dtype)
+    for _ in range(max(1, int(levels))):
+        if current_weight.shape[-2:] != current_synthetic.shape[-2:]:
+            current_weight = F.interpolate(
+                current_weight,
+                size=current_synthetic.shape[-2:],
+                mode="nearest",
+            )
+        if (current_weight > 0.0).any():
+            dissimilarity = (1.0 - ssim_map_2d(current_synthetic, current_target).clamp(-1.0, 1.0)) * 0.5
+            losses.append(weighted_mean(dissimilarity, current_weight.clamp_min(1e-4)))
+        if min(current_synthetic.shape[-2:]) < 24:
+            break
+        current_synthetic = F.avg_pool2d(current_synthetic, kernel_size=2, stride=2)
+        current_target = F.avg_pool2d(current_target, kernel_size=2, stride=2)
+        current_weight = F.avg_pool2d(current_weight, kernel_size=2, stride=2)
+    if not losses:
+        return synthetic.new_zeros(())
+    return torch.stack(losses).mean()
+
+
+def laplacian_pyramid_fidelity_loss(
+    synthetic: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+    levels: int,
+) -> torch.Tensor:
+    losses = []
+    current_synthetic = synthetic
+    current_target = target
+    current_weight = weight.to(device=synthetic.device, dtype=synthetic.dtype)
+    for _ in range(max(1, int(levels))):
+        if min(current_synthetic.shape[-2:]) < 16:
+            break
+        if current_weight.shape[-2:] != current_synthetic.shape[-2:]:
+            current_weight = F.interpolate(
+                current_weight,
+                size=current_synthetic.shape[-2:],
+                mode="nearest",
+            )
+        low_synthetic = F.avg_pool2d(current_synthetic, kernel_size=2, stride=2)
+        low_target = F.avg_pool2d(current_target, kernel_size=2, stride=2)
+        high_synthetic = current_synthetic - F.interpolate(
+            low_synthetic,
+            size=current_synthetic.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        high_target = current_target - F.interpolate(
+            low_target,
+            size=current_target.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        if (current_weight > 0.0).any():
+            detail_error = F.smooth_l1_loss(
+                high_synthetic,
+                high_target.detach(),
+                beta=0.015,
+                reduction="none",
+            )
+            losses.append(weighted_mean(detail_error, current_weight.clamp_min(1e-4)))
+        current_synthetic = low_synthetic
+        current_target = low_target
+        current_weight = F.avg_pool2d(current_weight, kernel_size=2, stride=2)
+    if not losses:
+        return synthetic.new_zeros(())
+    return torch.stack(losses).mean()
+
+
 def tumor_edge_loss(
     synthetic: torch.Tensor,
     target: torch.Tensor,
@@ -788,6 +945,151 @@ def core_overfill_loss(
         return synthetic.new_zeros(())
     over = F.relu(synthetic - target)
     return weighted_mean(over, core_without_enhancement.float())
+
+
+def refinement_residual_target_loss(
+    generated: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    target_regions: torch.Tensor,
+    dilation: int,
+    max_abs_residual: float,
+) -> torch.Tensor:
+    if "stage1_synthetic" not in generated:
+        return target.new_zeros(())
+    stage1 = generated["stage1_synthetic"].detach()
+    applied_residual = generated["synthetic"] - stage1
+    residual_target = (target - stage1).clamp(
+        min=-float(max_abs_residual),
+        max=float(max_abs_residual),
+    )
+    weights = lesion_refinement_target(target_regions, dilation).to(
+        device=target.device,
+        dtype=target.dtype,
+    )
+    if not (weights > 0.0).any():
+        return target.new_zeros(())
+    loss = F.smooth_l1_loss(
+        applied_residual,
+        residual_target.detach(),
+        beta=0.03,
+        reduction="none",
+    )
+    return weighted_mean(loss, weights.clamp_min(1e-4))
+
+
+def refinement_direction_loss(
+    generated: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    target_regions: torch.Tensor,
+    dilation: int,
+) -> torch.Tensor:
+    if "stage1_synthetic" not in generated:
+        return target.new_zeros(())
+    needed = (target - generated["stage1_synthetic"].detach()).detach()
+    applied_residual = generated["synthetic"] - generated["stage1_synthetic"].detach()
+    weights = lesion_refinement_target(target_regions, dilation).to(
+        device=target.device,
+        dtype=target.dtype,
+    )
+    weights = weights * needed.abs().clamp_min(1e-4)
+    if not (weights > 0.0).any():
+        return target.new_zeros(())
+    wrong_direction = F.relu(-(applied_residual * needed))
+    return weighted_mean(wrong_direction, weights)
+
+
+def refinement_residual_budget_loss(
+    generated: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    target_regions: torch.Tensor,
+    dilation: int,
+    region: str,
+) -> torch.Tensor:
+    if "stage1_synthetic" not in generated:
+        return target.new_zeros(())
+    stage1 = generated["stage1_synthetic"].detach()
+    applied = (generated["synthetic"] - stage1).abs()
+    budget = (target - stage1).abs().detach()
+    overshoot = F.relu(applied - budget)
+    lesion = lesion_refinement_target(target_regions, dilation).to(
+        device=target.device,
+        dtype=target.dtype,
+    )
+    if region == "all":
+        weights = torch.ones_like(overshoot)
+    elif region == "lesion":
+        weights = lesion
+    elif region == "background":
+        weights = (1.0 - lesion).clamp(0.0, 1.0)
+    else:
+        raise ValueError(f"Unknown residual-budget region: {region}")
+    if not (weights > 0.0).any():
+        return target.new_zeros(())
+    return weighted_mean(overshoot, weights.clamp_min(1e-4))
+
+
+def refinement_no_harm_loss(
+    generated: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    target_regions: torch.Tensor,
+    dilation: int,
+    margin: float,
+    region: str,
+) -> torch.Tensor:
+    if "stage1_synthetic" not in generated:
+        return target.new_zeros(())
+    synthetic = generated["synthetic"]
+    stage1 = generated["stage1_synthetic"].detach()
+    final_error = (synthetic - target).abs()
+    stage1_error = (stage1 - target).abs()
+    harm = F.relu(final_error - stage1_error + float(margin))
+    lesion = lesion_refinement_target(target_regions, dilation).to(
+        device=target.device,
+        dtype=target.dtype,
+    )
+    if region == "all":
+        weights = torch.ones_like(harm)
+    elif region == "lesion":
+        weights = lesion
+    elif region == "background":
+        weights = (1.0 - lesion).clamp(0.0, 1.0)
+    else:
+        raise ValueError(f"Unknown no-harm region: {region}")
+    if not (weights > 0.0).any():
+        return target.new_zeros(())
+    return weighted_mean(harm, weights.clamp_min(1e-4))
+
+
+def refinement_acceptance_supervision_loss(
+    generated: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    target_regions: torch.Tensor,
+    dilation: int,
+    error_threshold: float,
+    max_pos_weight: float = 20.0,
+) -> torch.Tensor:
+    if "refinement_acceptance_logits" not in generated or "stage1_synthetic" not in generated:
+        return target.new_zeros(())
+    logits = generated["refinement_acceptance_logits"]
+    stage1_error = (generated["stage1_synthetic"].detach() - target).abs()
+    lesion = lesion_refinement_target(target_regions, dilation).to(
+        device=target.device,
+        dtype=target.dtype,
+    )
+    threshold = max(float(error_threshold), 1e-6)
+    target_acceptance = ((stage1_error - threshold) / threshold).clamp(0.0, 1.0) * lesion
+    positive_fraction = target_acceptance.detach().mean().clamp_min(1e-4)
+    pos_weight = ((1.0 - positive_fraction) / positive_fraction).clamp(
+        min=1.0,
+        max=float(max_pos_weight),
+    )
+    loss = F.binary_cross_entropy_with_logits(
+        logits,
+        target_acceptance.detach(),
+        reduction="none",
+        pos_weight=pos_weight,
+    )
+    return loss.mean()
 
 
 def lesion_residual_target_loss(
@@ -1118,6 +1420,83 @@ def window_feature_alignment_loss(
     return weighted_mean(feature_error.unsqueeze(1), weights.unsqueeze(1))
 
 
+def micro_window_feature_alignment_loss(
+    synthetic: torch.Tensor,
+    target: torch.Tensor,
+    focus: torch.Tensor,
+    window_sizes: Sequence[int],
+    stride: int,
+    token_clamp: float,
+) -> torch.Tensor:
+    synthetic_features = conv_medical_features_2d(synthetic)
+    target_features = conv_medical_features_2d(target)
+    losses = []
+    for raw_size in window_sizes:
+        size = max(1, int(raw_size))
+        generated_tokens = normalize_window_tokens(
+            window_tokens_2d(synthetic_features, size, stride),
+            token_clamp,
+        )
+        positive_tokens = normalize_window_tokens(
+            window_tokens_2d(target_features, size, stride),
+            token_clamp,
+        )
+        weights = window_weights_2d(focus, size, stride).to(generated_tokens.dtype)
+        feature_error = F.smooth_l1_loss(
+            generated_tokens,
+            positive_tokens.detach(),
+            reduction="none",
+            beta=0.18,
+        ).mean(dim=2)
+        losses.append(weighted_mean(feature_error.unsqueeze(1), weights.unsqueeze(1)))
+    if not losses:
+        return synthetic.new_zeros(())
+    return torch.stack(losses).mean()
+
+
+def micro_window_drift_alignment_loss(
+    synthetic: torch.Tensor,
+    target: torch.Tensor,
+    focus: torch.Tensor,
+    window_sizes: Sequence[int],
+    stride: int,
+    token_clamp: float,
+    radii: Sequence[float],
+    max_tokens: int,
+) -> torch.Tensor:
+    synthetic_features = conv_medical_features_2d(synthetic)
+    target_features = conv_medical_features_2d(target)
+    losses = []
+    for raw_size in window_sizes:
+        size = max(1, int(raw_size))
+        generated_tokens = window_tokens_2d(synthetic_features, size, stride)
+        positive_tokens = window_tokens_2d(target_features, size, stride)
+        generated_tokens, positive_tokens, _ = normalize_token_triplet(
+            generated_tokens,
+            positive_tokens,
+            None,
+            token_clamp,
+        )
+        weights = window_weights_2d(focus, size, stride).to(generated_tokens.dtype)
+        generated_tokens, positive_tokens, weights = subsample_pair_tokens_by_weight(
+            generated_tokens,
+            positive_tokens,
+            weights,
+            max_tokens,
+        )
+        loss, _ = drift_loss(
+            generated=generated_tokens,
+            positive=positive_tokens,
+            weight_generated=weights,
+            weight_positive=weights,
+            radii=radii,
+        )
+        losses.append(loss)
+    if not losses:
+        return synthetic.new_zeros(())
+    return torch.stack(losses).mean()
+
+
 def compact_window_stats_tokens_2d(
     features: torch.Tensor,
     window_size: int,
@@ -1432,7 +1811,7 @@ def medical_multilevel_drift_loss(
 
 
 def loss_for_batch(
-    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator,
+    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
     batch: dict[str, Any],
     args: argparse.Namespace,
     medical_bank: MedicalDriftBank2D | None = None,
@@ -1464,6 +1843,40 @@ def loss_for_batch(
     grad = (
         gradient_difference_loss(synthetic, target, focus)
         if float(args.gradient_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    lesion_focus = lesion_refinement_target(batch["target_regions"], args.gate_target_dilation).to(
+        device=synthetic.device,
+        dtype=synthetic.dtype,
+    )
+    multiscale_ssim = (
+        multiscale_ssim_loss(synthetic, target, focus, args.fidelity_pyramid_levels)
+        if float(args.multiscale_ssim_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    lesion_multiscale_ssim = (
+        multiscale_ssim_loss(
+            synthetic,
+            target,
+            lesion_focus.clamp_min(1e-4),
+            args.fidelity_pyramid_levels,
+        )
+        if float(args.lesion_multiscale_ssim_weight) > 0.0 and (lesion_focus > 0.0).any()
+        else synthetic.new_zeros(())
+    )
+    laplacian_pyramid = (
+        laplacian_pyramid_fidelity_loss(synthetic, target, focus, args.fidelity_pyramid_levels)
+        if float(args.laplacian_pyramid_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    lesion_laplacian_pyramid = (
+        laplacian_pyramid_fidelity_loss(
+            synthetic,
+            target,
+            lesion_focus.clamp_min(1e-4),
+            args.fidelity_pyramid_levels,
+        )
+        if float(args.lesion_laplacian_pyramid_weight) > 0.0 and (lesion_focus > 0.0).any()
         else synthetic.new_zeros(())
     )
     drift = (
@@ -1500,6 +1913,32 @@ def loss_for_batch(
             args.window_token_clamp,
         )
         if float(args.window_feature_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    micro_window_feature = (
+        micro_window_feature_alignment_loss(
+            synthetic,
+            target,
+            lesion_focus.clamp_min(1e-4),
+            args.micro_window_sizes,
+            args.micro_window_stride,
+            args.window_token_clamp,
+        )
+        if float(args.micro_window_feature_weight) > 0.0 and (lesion_focus > 0.0).any()
+        else synthetic.new_zeros(())
+    )
+    micro_window_drift = (
+        micro_window_drift_alignment_loss(
+            synthetic,
+            target,
+            lesion_focus.clamp_min(1e-4),
+            args.micro_window_sizes,
+            args.micro_window_stride,
+            args.window_token_clamp,
+            args.micro_window_drift_radii,
+            args.micro_window_drift_max_tokens,
+        )
+        if float(args.micro_window_drift_weight) > 0.0 and (lesion_focus > 0.0).any()
         else synthetic.new_zeros(())
     )
     medical_drift_report: dict[str, float] = {}
@@ -1600,6 +2039,96 @@ def loss_for_batch(
         if float(args.core_overfill_weight) > 0.0
         else synthetic.new_zeros(())
     )
+    acceptance_supervision = (
+        refinement_acceptance_supervision_loss(
+            generated,
+            target,
+            batch["target_regions"],
+            args.gate_target_dilation,
+            args.acceptance_error_threshold,
+        )
+        if float(args.acceptance_supervision_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    refinement_residual_target = (
+        refinement_residual_target_loss(
+            generated,
+            target,
+            batch["target_regions"],
+            args.gate_target_dilation,
+            args.refinement_residual_scale,
+        )
+        if float(args.refinement_residual_target_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    refinement_direction = (
+        refinement_direction_loss(
+            generated,
+            target,
+            batch["target_regions"],
+            args.gate_target_dilation,
+        )
+        if float(args.refinement_direction_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    refinement_residual_budget = (
+        refinement_residual_budget_loss(
+            generated,
+            target,
+            batch["target_regions"],
+            args.gate_target_dilation,
+            "all",
+        )
+        if float(args.refinement_residual_budget_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    refinement_lesion_budget = (
+        refinement_residual_budget_loss(
+            generated,
+            target,
+            batch["target_regions"],
+            args.gate_target_dilation,
+            "lesion",
+        )
+        if float(args.refinement_lesion_budget_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    refinement_no_harm = (
+        refinement_no_harm_loss(
+            generated,
+            target,
+            batch["target_regions"],
+            args.gate_target_dilation,
+            args.refinement_no_harm_margin,
+            "all",
+        )
+        if float(args.refinement_no_harm_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    refinement_lesion_no_harm = (
+        refinement_no_harm_loss(
+            generated,
+            target,
+            batch["target_regions"],
+            args.gate_target_dilation,
+            args.refinement_no_harm_margin,
+            "lesion",
+        )
+        if float(args.refinement_lesion_no_harm_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    refinement_background_no_harm = (
+        refinement_no_harm_loss(
+            generated,
+            target,
+            batch["target_regions"],
+            args.gate_target_dilation,
+            args.refinement_no_harm_margin,
+            "background",
+        )
+        if float(args.refinement_background_no_harm_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
     lesion_residual_target = (
         lesion_residual_target_loss(generated, target, batch["target_regions"])
         if float(args.lesion_residual_target_weight) > 0.0
@@ -1652,9 +2181,15 @@ def loss_for_batch(
         float(args.recon_weight) * recon
         + float(args.nll_weight) * nll
         + float(args.gradient_weight) * grad
+        + float(args.multiscale_ssim_weight) * multiscale_ssim
+        + float(args.lesion_multiscale_ssim_weight) * lesion_multiscale_ssim
+        + float(args.laplacian_pyramid_weight) * laplacian_pyramid
+        + float(args.lesion_laplacian_pyramid_weight) * lesion_laplacian_pyramid
         + float(args.drift_weight) * drift
         + float(args.window_drift_weight) * window_drift
         + float(args.window_feature_weight) * window_feature
+        + float(args.micro_window_feature_weight) * micro_window_feature
+        + float(args.micro_window_drift_weight) * micro_window_drift
         + float(args.medical_drift_weight) * medical_drift
         + float(args.transport_velocity_weight) * transport_velocity
         + float(args.transport_path_weight) * transport_path
@@ -1669,6 +2204,14 @@ def loss_for_batch(
         + float(args.gate_sparsity_weight) * gate_sparsity
         + float(args.background_preserve_weight) * background_preserve
         + float(args.core_overfill_weight) * core_overfill
+        + float(args.acceptance_supervision_weight) * acceptance_supervision
+        + float(args.refinement_residual_target_weight) * refinement_residual_target
+        + float(args.refinement_direction_weight) * refinement_direction
+        + float(args.refinement_residual_budget_weight) * refinement_residual_budget
+        + float(args.refinement_lesion_budget_weight) * refinement_lesion_budget
+        + float(args.refinement_no_harm_weight) * refinement_no_harm
+        + float(args.refinement_lesion_no_harm_weight) * refinement_lesion_no_harm
+        + float(args.refinement_background_no_harm_weight) * refinement_background_no_harm
         + float(args.lesion_residual_target_weight) * lesion_residual_target
         + float(args.enhancement_residual_target_weight) * enhancement_residual_target
         + float(args.enhancement_leak_weight) * enhancement_leak
@@ -1681,9 +2224,15 @@ def loss_for_batch(
         "recon_l1": float(recon.detach().cpu().item()),
         "nll": float(nll.detach().cpu().item()),
         "gradient_l1": float(grad.detach().cpu().item()),
+        "multiscale_ssim": float(multiscale_ssim.detach().cpu().item()),
+        "lesion_multiscale_ssim": float(lesion_multiscale_ssim.detach().cpu().item()),
+        "laplacian_pyramid": float(laplacian_pyramid.detach().cpu().item()),
+        "lesion_laplacian_pyramid": float(lesion_laplacian_pyramid.detach().cpu().item()),
         "drift_loss": float(drift.detach().cpu().item()),
         "window_drift_loss": float(window_drift.detach().cpu().item()),
         "window_feature_loss": float(window_feature.detach().cpu().item()),
+        "micro_window_feature_loss": float(micro_window_feature.detach().cpu().item()),
+        "micro_window_drift_loss": float(micro_window_drift.detach().cpu().item()),
         "medical_drift_loss": float(medical_drift.detach().cpu().item()),
         "transport_velocity_loss": float(transport_velocity.detach().cpu().item()),
         "transport_path_loss": float(transport_path.detach().cpu().item()),
@@ -1698,6 +2247,16 @@ def loss_for_batch(
         "gate_sparsity": float(gate_sparsity.detach().cpu().item()),
         "background_preserve": float(background_preserve.detach().cpu().item()),
         "core_overfill": float(core_overfill.detach().cpu().item()),
+        "acceptance_supervision": float(acceptance_supervision.detach().cpu().item()),
+        "refinement_residual_target": float(refinement_residual_target.detach().cpu().item()),
+        "refinement_direction": float(refinement_direction.detach().cpu().item()),
+        "refinement_residual_budget": float(refinement_residual_budget.detach().cpu().item()),
+        "refinement_lesion_budget": float(refinement_lesion_budget.detach().cpu().item()),
+        "refinement_no_harm": float(refinement_no_harm.detach().cpu().item()),
+        "refinement_lesion_no_harm": float(refinement_lesion_no_harm.detach().cpu().item()),
+        "refinement_background_no_harm": float(
+            refinement_background_no_harm.detach().cpu().item()
+        ),
         "lesion_residual_target": float(lesion_residual_target.detach().cpu().item()),
         "enhancement_residual_target": float(enhancement_residual_target.detach().cpu().item()),
         "enhancement_leak": float(enhancement_leak.detach().cpu().item()),
@@ -1715,6 +2274,13 @@ def loss_for_batch(
         ),
         "gate_mean": float(
             generated.get("refinement_gate", synthetic.new_zeros(()))
+            .detach()
+            .mean()
+            .cpu()
+            .item()
+        ),
+        "acceptance_mean": float(
+            generated.get("refinement_acceptance", synthetic.new_zeros(()))
             .detach()
             .mean()
             .cpu()
@@ -1754,6 +2320,7 @@ def evaluate(
         target_features = conv_medical_features_2d(target)
         edge_error = (synthetic_features[:, 3:4] - target_features[:, 3:4]).abs()
         laplacian_error = (synthetic_features[:, 4:5] - target_features[:, 4:5]).abs()
+        ssim_map = ssim_map_2d(synthetic, target)
         tumor = batch["target_regions"][:, 2:3] > 0.5
         if tumor.any():
             high_threshold = torch.quantile(target[tumor].detach().float(), 0.70)
@@ -1767,6 +2334,7 @@ def evaluate(
             "mae": float(error.mean().cpu().item()),
             "mse": float(mse.cpu().item()),
             "psnr": psnr,
+            "ssim": float(ssim_map.mean().cpu().item()),
             "edge_mae": float(edge_error.mean().cpu().item()),
             "laplacian_mae": float(laplacian_error.mean().cpu().item()),
             "confidence_mean": float(generated["confidence"].mean().cpu().item()),
@@ -1784,8 +2352,15 @@ def evaluate(
         if "stage1_synthetic" in generated:
             stage1_error = (generated["stage1_synthetic"] - target).abs()
             row["stage1_mae"] = float(stage1_error.mean().cpu().item())
+            harm_map = (error > stage1_error + 1e-4).float()
+            improvement_map = (error + 1e-4 < stage1_error).float()
+            applied_delta = (synthetic - generated["stage1_synthetic"]).abs()
+            overshoot_map = (applied_delta > stage1_error.detach() + 1e-4).float()
+            row["refinement_harm_rate"] = float(harm_map.mean().cpu().item())
+            row["refinement_improvement_rate"] = float(improvement_map.mean().cpu().item())
+            row["refinement_overshoot_rate"] = float(overshoot_map.mean().cpu().item())
             row["delta_from_stage1"] = float(
-                (synthetic - generated["stage1_synthetic"]).abs().mean().cpu().item()
+                applied_delta.mean().cpu().item()
             )
             gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
                 device=synthetic.device,
@@ -1795,7 +2370,7 @@ def evaluate(
             lesion = gate_target.clamp(0.0, 1.0)
             row["background_delta_from_stage1"] = float(
                 weighted_mean(
-                    (synthetic - generated["stage1_synthetic"]).abs(),
+                    applied_delta,
                     background.clamp_min(1e-4),
                 )
                 .cpu()
@@ -1803,11 +2378,23 @@ def evaluate(
             )
             row["lesion_delta_from_stage1"] = float(
                 weighted_mean(
-                    (synthetic - generated["stage1_synthetic"]).abs(),
+                    applied_delta,
                     lesion.clamp_min(1e-4),
                 )
                 .cpu()
                 .item()
+            )
+            row["lesion_harm_rate"] = float(
+                weighted_mean(harm_map, lesion.clamp_min(1e-4)).cpu().item()
+            )
+            row["background_harm_rate"] = float(
+                weighted_mean(harm_map, background.clamp_min(1e-4)).cpu().item()
+            )
+            row["lesion_overshoot_rate"] = float(
+                weighted_mean(overshoot_map, lesion.clamp_min(1e-4)).cpu().item()
+            )
+            row["background_overshoot_rate"] = float(
+                weighted_mean(overshoot_map, background.clamp_min(1e-4)).cpu().item()
             )
         if "refinement_gate" in generated:
             gate = generated["refinement_gate"]
@@ -1823,6 +2410,21 @@ def evaluate(
             )
             row["gate_background_mean"] = float(
                 weighted_mean(gate, background.clamp_min(1e-4)).cpu().item()
+            )
+        if "refinement_acceptance" in generated:
+            acceptance = generated["refinement_acceptance"]
+            gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
+                device=acceptance.device,
+                dtype=acceptance.dtype,
+            )
+            background = (1.0 - gate_target).clamp(0.0, 1.0)
+            lesion = gate_target.clamp(0.0, 1.0)
+            row["acceptance_mean"] = float(acceptance.mean().cpu().item())
+            row["acceptance_lesion_mean"] = float(
+                weighted_mean(acceptance, lesion.clamp_min(1e-4)).cpu().item()
+            )
+            row["acceptance_background_mean"] = float(
+                weighted_mean(acceptance, background.clamp_min(1e-4)).cpu().item()
             )
         if "prompt_logits" in generated:
             row.update(
@@ -1840,6 +2442,9 @@ def evaluate(
             row[f"mae_{region}"] = (
                 float(error[mask].mean().cpu().item()) if mask.any() else float("nan")
             )
+            row[f"ssim_{region}"] = (
+                float(ssim_map[mask].mean().cpu().item()) if mask.any() else float("nan")
+            )
             row[f"edge_mae_{region}"] = (
                 float(edge_error[mask].mean().cpu().item()) if mask.any() else float("nan")
             )
@@ -1852,6 +2457,55 @@ def evaluate(
         key: float(np.mean([row[key] for row in rows if math.isfinite(row[key])]))
         for key in keys
     }
+
+
+def eval_metric(metrics: dict[str, float], key: str, default: float = float("inf")) -> float:
+    value = metrics.get(key, default)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(value):
+        return float(default)
+    return value
+
+
+def selection_score(metrics: dict[str, float], mode: str) -> float:
+    if mode == "mae":
+        return eval_metric(metrics, "mae")
+    if mode != "lesion_composite":
+        raise ValueError(f"Unknown best metric: {mode}")
+    mae = eval_metric(metrics, "mae")
+    if not math.isfinite(mae):
+        return float("inf")
+    ssim_penalty = max(0.0, 1.0 - eval_metric(metrics, "ssim", 1.0))
+    lesion_ssim_penalty = max(
+        0.0,
+        1.0
+        - np.mean(
+            [
+                eval_metric(metrics, "ssim_ET", 1.0),
+                eval_metric(metrics, "ssim_TC", 1.0),
+                eval_metric(metrics, "ssim_WT", 1.0),
+            ]
+        ),
+    )
+    score = (
+        0.35 * mae
+        + 0.20 * eval_metric(metrics, "high_tumor_mae", mae)
+        + 0.16 * eval_metric(metrics, "high_tumor_under", mae)
+        + 0.12 * eval_metric(metrics, "mae_ET", mae)
+        + 0.08 * eval_metric(metrics, "mae_TC", mae)
+        + 0.04 * eval_metric(metrics, "mae_WT", mae)
+        + 0.03 * eval_metric(metrics, "edge_mae", mae)
+        + 0.02 * eval_metric(metrics, "laplacian_mae", mae)
+        + 0.08 * eval_metric(metrics, "refinement_harm_rate", 0.0)
+        + 0.08 * eval_metric(metrics, "lesion_harm_rate", 0.0)
+        + 0.04 * eval_metric(metrics, "background_delta_from_stage1", 0.0)
+        + 0.04 * ssim_penalty
+        + 0.04 * float(lesion_ssim_penalty)
+    )
+    return float(score)
 
 
 def train_one_epoch(
@@ -1951,6 +2605,10 @@ def build_model(
                 gated_refinement=args.gated_refinement,
                 refinement_residual_scale=args.refinement_residual_scale,
                 gate_bias_init=args.gate_bias_init,
+                refinement_acceptance_gate=args.refinement_acceptance_gate,
+                accept_bias_init=args.accept_bias_init,
+                refinement_channels_multiplier=args.refinement_channels_multiplier,
+                refinement_blocks=args.refinement_blocks,
             )
         )
     return SliceVirtualModalityGenerator(
@@ -1973,6 +2631,108 @@ def remap_checkpoint_state(
         if out_bias is not None:
             mapped["base_out.bias"] = out_bias.clone()
     target_state = model.state_dict()
+
+    def copy_modalities_with_center_context(
+        expanded: torch.Tensor,
+        source: torch.Tensor,
+        source_start: int,
+        target_start: int,
+        old_modalities: int,
+        new_modalities: int,
+    ) -> None:
+        if old_modalities <= 0 or new_modalities <= 0:
+            return
+        old_depth = max(1, old_modalities // len(BRATS_MODALITIES))
+        new_depth = max(1, new_modalities // len(BRATS_MODALITIES))
+        old_center = old_depth // 2
+        new_center = new_depth // 2
+        for modality_index in range(len(BRATS_MODALITIES)):
+            old_channel = source_start + modality_index * old_depth + min(old_center, old_depth - 1)
+            new_channel = target_start + modality_index * new_depth + min(new_center, new_depth - 1)
+            if old_channel < source.shape[1] and new_channel < expanded.shape[1]:
+                expanded[:, new_channel] = source[:, old_channel].to(
+                    device=expanded.device,
+                    dtype=expanded.dtype,
+                )
+
+    def expand_transport_stem_conv(key: str) -> bool:
+        if key not in mapped or key not in target_state:
+            return False
+        source = mapped[key]
+        target = target_state[key]
+        if source.ndim != 4 or target.ndim != 4 or source.shape[0] != target.shape[0] or source.shape[2:] != target.shape[2:]:
+            return False
+        if source.shape[1] == target.shape[1]:
+            return False
+        target_class_channels = int(getattr(model.config, "class_channels", 0)) if bool(
+            getattr(model.config, "class_conditioned", False)
+        ) else 0
+        source_class_channels = target_class_channels if (source.shape[1] - target_class_channels - 3) % 2 == 0 else 0
+        old_modalities = (int(source.shape[1]) - source_class_channels - 3) // 2
+        new_modalities = int(getattr(model.config, "in_modalities", len(BRATS_MODALITIES)))
+        if old_modalities <= 0 or new_modalities <= 0:
+            return False
+        expanded = target.clone()
+        expanded.zero_()
+        expanded[:, 0] = source[:, 0]
+        copy_modalities_with_center_context(expanded, source, 1, 1, old_modalities, new_modalities)
+        copy_modalities_with_center_context(
+            expanded,
+            source,
+            1 + old_modalities,
+            1 + new_modalities,
+            old_modalities,
+            new_modalities,
+        )
+        old_tail = 1 + 2 * old_modalities
+        new_tail = 1 + 2 * new_modalities
+        tail_count = min(source.shape[1] - old_tail, target.shape[1] - new_tail)
+        if tail_count > 0:
+            expanded[:, new_tail : new_tail + tail_count] = source[
+                :,
+                old_tail : old_tail + tail_count,
+            ].to(device=expanded.device, dtype=expanded.dtype)
+        mapped[key] = expanded
+        return True
+
+    def expand_refinement_input_conv(key: str) -> bool:
+        if key not in mapped or key not in target_state:
+            return False
+        source = mapped[key]
+        target = target_state[key]
+        if source.ndim != 4 or target.ndim != 4 or source.shape[0] != target.shape[0] or source.shape[2:] != target.shape[2:]:
+            return False
+        if source.shape[1] == target.shape[1]:
+            return False
+        target_class_channels = int(getattr(model.config, "class_channels", 0)) if bool(
+            getattr(model.config, "class_conditioned", False)
+        ) else 0
+        source_class_channels = target_class_channels if (source.shape[1] - target_class_channels - 3) % 2 == 0 else 0
+        old_modalities = (int(source.shape[1]) - source_class_channels - 3) // 2
+        new_modalities = int(getattr(model.config, "in_modalities", len(BRATS_MODALITIES)))
+        if old_modalities <= 0 or new_modalities <= 0:
+            return False
+        expanded = target.clone()
+        expanded.zero_()
+        copy_modalities_with_center_context(expanded, source, 0, 0, old_modalities, new_modalities)
+        copy_modalities_with_center_context(
+            expanded,
+            source,
+            old_modalities,
+            new_modalities,
+            old_modalities,
+            new_modalities,
+        )
+        old_tail = 2 * old_modalities
+        new_tail = 2 * new_modalities
+        tail_count = min(source.shape[1] - old_tail, target.shape[1] - new_tail)
+        if tail_count > 0:
+            expanded[:, new_tail : new_tail + tail_count] = source[
+                :,
+                old_tail : old_tail + tail_count,
+            ].to(device=expanded.device, dtype=expanded.dtype)
+        mapped[key] = expanded
+        return True
 
     def expand_first_conv(key: str, old_modalities: int, new_modalities: int) -> None:
         if key not in mapped or key not in target_state:
@@ -1998,20 +2758,86 @@ def remap_checkpoint_state(
             for modality_index in range(old_modalities):
                 old_image = modality_index * old_depth + old_center
                 new_image = modality_index * new_depth + new_center
-                expanded[:, new_image] = source[:, old_image]
+                expanded[:, new_image] = source[:, old_image].to(
+                    device=expanded.device,
+                    dtype=expanded.dtype,
+                )
                 old_mask = old_modalities * old_depth + modality_index * old_depth + old_center
                 new_mask = new_modalities + modality_index * new_depth + new_center
                 if old_mask < old_width and new_mask < new_width:
-                    expanded[:, new_mask] = source[:, old_mask]
+                    expanded[:, new_mask] = source[:, old_mask].to(
+                        device=expanded.device,
+                        dtype=expanded.dtype,
+                    )
         else:
-            expanded[:, : min(old_width, new_width)] = source[:, : min(old_width, new_width)]
+            expanded[:, : min(old_width, new_width)] = source[
+                :,
+                : min(old_width, new_width),
+            ].to(device=expanded.device, dtype=expanded.dtype)
         mapped[key] = expanded
 
     new_modalities = int(getattr(model.config, "in_modalities", len(BRATS_MODALITIES)))
-    expand_first_conv("stem.0.net.0.weight", len(BRATS_MODALITIES), new_modalities)
+    if isinstance(model, SliceDriftTransportGenerator):
+        if not expand_transport_stem_conv("stem.0.net.0.weight"):
+            expand_first_conv("stem.0.net.0.weight", len(BRATS_MODALITIES), new_modalities)
+        expand_refinement_input_conv("refinement_context.0.net.0.weight")
+    else:
+        expand_first_conv("stem.0.net.0.weight", len(BRATS_MODALITIES), new_modalities)
     expand_first_conv("detail_residual.0.net.0.weight", len(BRATS_MODALITIES), new_modalities)
     expand_first_conv("enhancement_residual.0.net.0.weight", len(BRATS_MODALITIES), new_modalities)
+    if isinstance(model, SliceDriftTransportGenerator) and bool(
+        getattr(model.config, "gated_refinement", False)
+    ):
+        final_context_index = max(1, int(getattr(model.config, "refinement_blocks", 1))) + 1
+        old_prefix = "refinement_context.2."
+        new_prefix = f"refinement_context.{final_context_index}."
+        if final_context_index != 2:
+            for key, tensor in list(mapped.items()):
+                if key.startswith(old_prefix):
+                    mapped.setdefault(new_prefix + key[len(old_prefix) :], tensor)
     return mapped
+
+
+def compatible_checkpoint_state(
+    model: torch.nn.Module,
+    state: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]], list[dict[str, Any]]]:
+    target_state = model.state_dict()
+    compatible: dict[str, torch.Tensor] = {}
+    shape_mismatch: list[dict[str, Any]] = []
+    partial_shape_loads: list[dict[str, Any]] = []
+    for key, tensor in state.items():
+        target_tensor = target_state.get(key)
+        if target_tensor is None:
+            compatible[key] = tensor
+            continue
+        if tuple(tensor.shape) == tuple(target_tensor.shape):
+            compatible[key] = tensor
+            continue
+        if key.startswith("refinement_") and tensor.ndim == target_tensor.ndim:
+            widened = target_tensor.clone()
+            slices = tuple(
+                slice(0, min(int(source_dim), int(target_dim)))
+                for source_dim, target_dim in zip(tensor.shape, target_tensor.shape)
+            )
+            widened[slices] = tensor[slices].to(dtype=target_tensor.dtype)
+            compatible[key] = widened
+            partial_shape_loads.append(
+                {
+                    "key": key,
+                    "checkpoint_shape": list(tensor.shape),
+                    "model_shape": list(target_tensor.shape),
+                }
+            )
+            continue
+        shape_mismatch.append(
+            {
+                "key": key,
+                "checkpoint_shape": list(tensor.shape),
+                "model_shape": list(target_tensor.shape),
+            }
+        )
+    return compatible, shape_mismatch, partial_shape_loads
 
 
 def freeze_prompted_base(
@@ -2027,7 +2853,9 @@ def freeze_prompted_base(
             }
         trainable_prefixes = (
             "refinement_context.",
+            "refinement_feature_project.",
             "refinement_gate_head.",
+            "refinement_accept_head.",
             "refinement_residual_head.",
         )
         frozen = 0
@@ -2167,11 +2995,17 @@ def main() -> int:
                 f"resume checkpoint target {checkpoint_target!r} != requested {args.target_modality!r}"
             )
         checkpoint_state = remap_checkpoint_state(model, payload["model"])
+        checkpoint_state, shape_mismatch, partial_shape_loads = compatible_checkpoint_state(
+            model,
+            checkpoint_state,
+        )
         missing, unexpected = model.load_state_dict(checkpoint_state, strict=False)
         resume_report = {
             "path": args.resume_checkpoint,
             "missing_keys": list(missing),
             "unexpected_keys": list(unexpected),
+            "shape_mismatch_keys": shape_mismatch,
+            "partial_shape_loads": partial_shape_loads,
             "source_model_kind": payload.get("config", {}).get("model_kind", "slice"),
             "target_model_kind": args.model_kind,
         }
@@ -2209,6 +3043,7 @@ def main() -> int:
     best_checkpoint_path = output_dir / "slice_virtual_modality_generator_best.pt"
     best_eval = None
     best_epoch = None
+    best_score = float("inf")
     started = time.perf_counter()
     epoch_reports = []
     eval_reports = []
@@ -2223,12 +3058,24 @@ def main() -> int:
             medical_bank,
         )
         eval_report = evaluate(model, val_loader, args.device)
-        print(json.dumps({"epoch": epoch, **eval_report}), flush=True)
+        eval_score = selection_score(eval_report, args.best_metric)
+        eval_report = dict(eval_report)
+        eval_report["selection_score"] = float(eval_score)
+        print(
+            json.dumps(
+                {
+                    "epoch": epoch,
+                    "best_metric": args.best_metric,
+                    **eval_report,
+                }
+            ),
+            flush=True,
+        )
         epoch_reports.append(train_report)
         eval_reports.append({"epoch": epoch, "metrics": eval_report})
-        eval_mae = eval_report.get("mae")
-        if eval_mae is not None and math.isfinite(float(eval_mae)):
-            if best_eval is None or float(eval_mae) < float(best_eval["mae"]):
+        if math.isfinite(float(eval_score)):
+            if best_eval is None or float(eval_score) < best_score:
+                best_score = float(eval_score)
                 best_eval = dict(eval_report)
                 best_epoch = int(epoch)
                 torch.save(
@@ -2239,6 +3086,8 @@ def main() -> int:
                         "modalities": BRATS_MODALITIES,
                         "best_epoch": best_epoch,
                         "best_eval": best_eval,
+                        "best_metric": args.best_metric,
+                        "best_score": best_score,
                     },
                     best_checkpoint_path,
                 )
@@ -2268,6 +3117,8 @@ def main() -> int:
         "final_eval": eval_reports[-1]["metrics"] if eval_reports else {},
         "best_epoch": best_epoch,
         "best_eval": best_eval or {},
+        "best_metric": args.best_metric,
+        "best_score": best_score if best_epoch is not None else None,
         "best_checkpoint_path": str(best_checkpoint_path) if best_epoch is not None else None,
         "checkpoint_path": str(checkpoint_path),
         "memory": {
