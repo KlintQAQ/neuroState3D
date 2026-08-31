@@ -334,6 +334,10 @@ bash scripts/run_h20_best_t1c_experiment.sh
 This wrapper keeps the same end-to-end pipeline but raises the training budget
 and capacity for H20: full subject usage, no max-step cap, 64 hidden channels,
 8 transport steps, 48 slices per subject, 16 base epochs, 10 hard-case stage-2
-epochs, hard-slice mining, and representative/best/worst visual reports. It is
-the intended command when the goal is to push the current method line as hard as
-the H20 job budget allows.
+epochs, hard-slice mining, lesion-gated refinement, background-preservation
+losses, anti-overfill losses, and representative/best/worst visual reports. The
+stage-2 refinement gate uses a lightweight convolutional context head over the
+observed modalities, the stage-1 synthetic T1c, and uncertainty, so refinement
+can focus on lesion regions without retraining the full transport backbone. It
+is the intended command when the goal is to push the current method line as hard
+as the H20 job budget allows.

@@ -88,6 +88,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transport-velocity-weight", type=float, default=0.0)
     parser.add_argument("--transport-path-weight", type=float, default=0.0)
     parser.add_argument("--transport-monotonic-weight", type=float, default=0.0)
+    parser.add_argument("--gated-refinement", action="store_true")
+    parser.add_argument("--refinement-residual-scale", type=float, default=0.25)
+    parser.add_argument("--gate-bias-init", type=float, default=-3.0)
+    parser.add_argument("--gate-supervision-weight", type=float, default=0.0)
+    parser.add_argument("--gate-target-dilation", type=int, default=2)
+    parser.add_argument("--gate-sparsity-weight", type=float, default=0.0)
+    parser.add_argument("--background-preserve-weight", type=float, default=0.0)
+    parser.add_argument("--core-overfill-weight", type=float, default=0.0)
     parser.add_argument("--residual-scale", type=float, default=0.35)
     parser.add_argument("--lesion-residual-scale", type=float, default=0.45)
     parser.add_argument("--detail-residual-scale", type=float, default=0.20)
@@ -695,6 +703,91 @@ def enhancement_contrast_loss(
     if not terms:
         return synthetic.new_zeros(())
     return torch.stack(terms).mean()
+
+
+def lesion_refinement_target(
+    target_regions: torch.Tensor,
+    dilation: int,
+) -> torch.Tensor:
+    et = target_regions[:, 0:1].float()
+    tc = target_regions[:, 1:2].float()
+    wt = target_regions[:, 2:3].float()
+    target = (0.2 * wt + 0.55 * tc + et).clamp(0.0, 1.0)
+    if dilation > 0:
+        radius = int(dilation)
+        kernel = 2 * radius + 1
+        target = F.max_pool2d(target, kernel_size=kernel, stride=1, padding=radius)
+    return target.clamp(0.0, 1.0)
+
+
+def lesion_gate_supervision_loss(
+    generated: dict[str, torch.Tensor],
+    target_regions: torch.Tensor,
+    dilation: int,
+    max_pos_weight: float = 20.0,
+) -> torch.Tensor:
+    if "refinement_gate_logits" not in generated:
+        return target_regions.new_zeros(())
+    logits = generated["refinement_gate_logits"]
+    target = lesion_refinement_target(target_regions, dilation).to(logits.dtype)
+    positive_fraction = target.detach().mean().clamp_min(1e-4)
+    pos_weight = ((1.0 - positive_fraction) / positive_fraction).clamp(
+        min=1.0,
+        max=float(max_pos_weight),
+    )
+    bce = F.binary_cross_entropy_with_logits(
+        logits,
+        target,
+        reduction="none",
+        pos_weight=pos_weight,
+    )
+    return bce.mean()
+
+
+def refinement_gate_sparsity_loss(
+    generated: dict[str, torch.Tensor],
+    target_regions: torch.Tensor,
+    dilation: int,
+) -> torch.Tensor:
+    if "refinement_gate" not in generated:
+        return target_regions.new_zeros(())
+    gate = generated["refinement_gate"]
+    target = lesion_refinement_target(target_regions, dilation).to(gate.dtype)
+    background = (1.0 - target).clamp(0.0, 1.0)
+    if not (background > 0.0).any():
+        return gate.new_zeros(())
+    return weighted_mean(gate, background.clamp_min(1e-4))
+
+
+def background_preservation_loss(
+    generated: dict[str, torch.Tensor],
+    target_regions: torch.Tensor,
+    dilation: int,
+) -> torch.Tensor:
+    if "stage1_synthetic" not in generated:
+        return target_regions.new_zeros(())
+    target = lesion_refinement_target(target_regions, dilation).to(generated["synthetic"].dtype)
+    background = (1.0 - target).clamp(0.0, 1.0)
+    if not (background > 0.0).any():
+        return generated["synthetic"].new_zeros(())
+    return weighted_mean(
+        (generated["synthetic"] - generated["stage1_synthetic"].detach()).abs(),
+        background.clamp_min(1e-4),
+    )
+
+
+def core_overfill_loss(
+    synthetic: torch.Tensor,
+    target: torch.Tensor,
+    target_regions: torch.Tensor,
+) -> torch.Tensor:
+    tc = target_regions[:, 1:2].float()
+    et = target_regions[:, 0:1].float()
+    core_without_enhancement = (tc > 0.5) & (et <= 0.5)
+    if not core_without_enhancement.any():
+        return synthetic.new_zeros(())
+    over = F.relu(synthetic - target)
+    return weighted_mean(over, core_without_enhancement.float())
 
 
 def lesion_residual_target_loss(
@@ -1475,6 +1568,38 @@ def loss_for_batch(
         if float(args.enhancement_contrast_weight) > 0.0
         else synthetic.new_zeros(())
     )
+    gate_supervision = (
+        lesion_gate_supervision_loss(
+            generated,
+            batch["target_regions"],
+            args.gate_target_dilation,
+        )
+        if float(args.gate_supervision_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    gate_sparsity = (
+        refinement_gate_sparsity_loss(
+            generated,
+            batch["target_regions"],
+            args.gate_target_dilation,
+        )
+        if float(args.gate_sparsity_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    background_preserve = (
+        background_preservation_loss(
+            generated,
+            batch["target_regions"],
+            args.gate_target_dilation,
+        )
+        if float(args.background_preserve_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    core_overfill = (
+        core_overfill_loss(synthetic, target, batch["target_regions"])
+        if float(args.core_overfill_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
     lesion_residual_target = (
         lesion_residual_target_loss(generated, target, batch["target_regions"])
         if float(args.lesion_residual_target_weight) > 0.0
@@ -1540,6 +1665,10 @@ def loss_for_batch(
         + float(args.enhancement_under_weight) * enhance_under
         + float(args.lesion_boundary_weight) * lesion_boundary
         + float(args.enhancement_contrast_weight) * enhancement_contrast
+        + float(args.gate_supervision_weight) * gate_supervision
+        + float(args.gate_sparsity_weight) * gate_sparsity
+        + float(args.background_preserve_weight) * background_preserve
+        + float(args.core_overfill_weight) * core_overfill
         + float(args.lesion_residual_target_weight) * lesion_residual_target
         + float(args.enhancement_residual_target_weight) * enhancement_residual_target
         + float(args.enhancement_leak_weight) * enhancement_leak
@@ -1565,6 +1694,10 @@ def loss_for_batch(
         "enhancement_under": float(enhance_under.detach().cpu().item()),
         "lesion_boundary": float(lesion_boundary.detach().cpu().item()),
         "enhancement_contrast": float(enhancement_contrast.detach().cpu().item()),
+        "gate_supervision": float(gate_supervision.detach().cpu().item()),
+        "gate_sparsity": float(gate_sparsity.detach().cpu().item()),
+        "background_preserve": float(background_preserve.detach().cpu().item()),
+        "core_overfill": float(core_overfill.detach().cpu().item()),
         "lesion_residual_target": float(lesion_residual_target.detach().cpu().item()),
         "enhancement_residual_target": float(enhancement_residual_target.detach().cpu().item()),
         "enhancement_leak": float(enhancement_leak.detach().cpu().item()),
@@ -1573,6 +1706,20 @@ def loss_for_batch(
         "prompt_balanced_bce": float(prompt_bce.detach().cpu().item()),
         "uncertainty_mean": float(uncertainty.detach().mean().cpu().item()),
         "confidence_mean": float(generated["confidence"].detach().mean().cpu().item()),
+        "stage1_mae": float(
+            (generated.get("stage1_synthetic", synthetic).detach() - target.detach())
+            .abs()
+            .mean()
+            .cpu()
+            .item()
+        ),
+        "gate_mean": float(
+            generated.get("refinement_gate", synthetic.new_zeros(()))
+            .detach()
+            .mean()
+            .cpu()
+            .item()
+        ),
     } | medical_drift_report
 
 
@@ -1634,6 +1781,49 @@ def evaluate(
                 else float("nan")
             ),
         }
+        if "stage1_synthetic" in generated:
+            stage1_error = (generated["stage1_synthetic"] - target).abs()
+            row["stage1_mae"] = float(stage1_error.mean().cpu().item())
+            row["delta_from_stage1"] = float(
+                (synthetic - generated["stage1_synthetic"]).abs().mean().cpu().item()
+            )
+            gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
+                device=synthetic.device,
+                dtype=synthetic.dtype,
+            )
+            background = (1.0 - gate_target).clamp(0.0, 1.0)
+            lesion = gate_target.clamp(0.0, 1.0)
+            row["background_delta_from_stage1"] = float(
+                weighted_mean(
+                    (synthetic - generated["stage1_synthetic"]).abs(),
+                    background.clamp_min(1e-4),
+                )
+                .cpu()
+                .item()
+            )
+            row["lesion_delta_from_stage1"] = float(
+                weighted_mean(
+                    (synthetic - generated["stage1_synthetic"]).abs(),
+                    lesion.clamp_min(1e-4),
+                )
+                .cpu()
+                .item()
+            )
+        if "refinement_gate" in generated:
+            gate = generated["refinement_gate"]
+            gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
+                device=gate.device,
+                dtype=gate.dtype,
+            )
+            background = (1.0 - gate_target).clamp(0.0, 1.0)
+            lesion = gate_target.clamp(0.0, 1.0)
+            row["gate_mean"] = float(gate.mean().cpu().item())
+            row["gate_lesion_mean"] = float(
+                weighted_mean(gate, lesion.clamp_min(1e-4)).cpu().item()
+            )
+            row["gate_background_mean"] = float(
+                weighted_mean(gate, background.clamp_min(1e-4)).cpu().item()
+            )
         if "prompt_logits" in generated:
             row.update(
                 {
@@ -1758,6 +1948,9 @@ def build_model(
                 class_channels=len(BRATS_DATASETS),
                 class_conditioned=args.class_conditioned,
                 output_activation=args.output_activation,
+                gated_refinement=args.gated_refinement,
+                refinement_residual_scale=args.refinement_residual_scale,
+                gate_bias_init=args.gate_bias_init,
             )
         )
     return SliceVirtualModalityGenerator(
@@ -1826,6 +2019,27 @@ def freeze_prompted_base(
     detail_only: bool = False,
     train_prompt_with_detail: bool = False,
 ) -> dict[str, int]:
+    if isinstance(model, SliceDriftTransportGenerator):
+        if not bool(getattr(model.config, "gated_refinement", False)):
+            return {
+                "frozen_parameters": 0,
+                "trainable_parameters": sum(p.numel() for p in model.parameters()),
+            }
+        trainable_prefixes = (
+            "refinement_context.",
+            "refinement_gate_head.",
+            "refinement_residual_head.",
+        )
+        frozen = 0
+        trainable = 0
+        for name, parameter in model.named_parameters():
+            keep_trainable = name.startswith(trainable_prefixes)
+            parameter.requires_grad = keep_trainable
+            if keep_trainable:
+                trainable += parameter.numel()
+            else:
+                frozen += parameter.numel()
+        return {"frozen_parameters": frozen, "trainable_parameters": trainable}
     if not isinstance(model, PromptedSliceVirtualModalityGenerator):
         return {"frozen_parameters": 0, "trainable_parameters": sum(p.numel() for p in model.parameters())}
     if detail_only:

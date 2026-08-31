@@ -36,6 +36,31 @@ def test_transport_generator_outputs_iterative_state_shapes() -> None:
     assert output["drift_velocities"].shape == (2, 3, 1, 24, 24)
 
 
+def test_gated_refinement_preserves_stage1_shapes() -> None:
+    model = SliceDriftTransportGenerator(
+        SliceDriftTransportGeneratorConfig(
+            in_modalities=4,
+            hidden_channels=8,
+            transport_steps=2,
+            gated_refinement=True,
+            refinement_residual_scale=0.3,
+        )
+    )
+    image = torch.randn(2, 4, 20, 20)
+    mask = torch.ones(2, 4)
+    mask[:, 1] = 0.0
+
+    output = model(image, mask)
+
+    assert output["stage1_synthetic"].shape == (2, 1, 20, 20)
+    assert output["refinement_gate"].shape == (2, 1, 20, 20)
+    assert output["refinement_gate_logits"].shape == (2, 1, 20, 20)
+    assert output["refinement_residual"].shape == (2, 1, 20, 20)
+    assert output["synthetic"].shape == (2, 1, 20, 20)
+    assert output["refinement_gate"].min() >= 0.0
+    assert output["refinement_gate"].max() <= 1.0
+
+
 def test_transport_losses_backpropagate_to_velocity_head() -> None:
     model = SliceDriftTransportGenerator(
         SliceDriftTransportGeneratorConfig(

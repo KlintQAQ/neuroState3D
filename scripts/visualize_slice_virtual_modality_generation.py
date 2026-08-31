@@ -124,6 +124,9 @@ def load_model(
                 class_channels=len(BRATS_DATASETS),
                 class_conditioned=bool(config.get("class_conditioned", False)),
                 output_activation=str(config.get("output_activation", "hardtanh")),
+                gated_refinement=bool(config.get("gated_refinement", False)),
+                refinement_residual_scale=float(config.get("refinement_residual_scale", 0.25)),
+                gate_bias_init=float(config.get("gate_bias_init", -3.0)),
             )
         )
     else:
@@ -221,7 +224,14 @@ def generate_volume(
     target_index: int,
     batch_slices: int,
     dataset_name: str = "",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray,
+]:
     device = next(model.parameters()).device
     image = torch.nan_to_num(image.to(device), nan=0.0, posinf=1.0, neginf=-1.0).clamp(-3.0, 3.0)
     in_modalities = int(model.config.in_modalities)
@@ -236,6 +246,8 @@ def generate_volume(
     confidence_slices = []
     uncertainty_slices = []
     prompt_slices = []
+    gate_slices = []
+    stage1_slices = []
     for start in range(0, width, int(batch_slices)):
         end = min(start + int(batch_slices), width)
         slices = context_slice_batch(image, start, end, context_radius)
@@ -249,15 +261,22 @@ def generate_volume(
         synthetic_slices.append(output["synthetic"].squeeze(1).cpu())
         confidence_slices.append(output["confidence"].squeeze(1).cpu())
         uncertainty_slices.append(output["uncertainty"].squeeze(1).cpu())
+        stage1_slices.append(output.get("stage1_synthetic", output["synthetic"]).squeeze(1).cpu())
         if "prompt_probs" in output:
             prompt_slices.append(output["prompt_probs"].cpu())
+        if "refinement_gate" in output:
+            gate_slices.append(output["refinement_gate"].squeeze(1).cpu())
     synthetic = torch.cat(synthetic_slices, dim=0).numpy().transpose(1, 2, 0)
     confidence = torch.cat(confidence_slices, dim=0).numpy().transpose(1, 2, 0)
     uncertainty = torch.cat(uncertainty_slices, dim=0).numpy().transpose(1, 2, 0)
     prompt = None
     if prompt_slices:
         prompt = torch.cat(prompt_slices, dim=0).numpy().transpose(1, 2, 3, 0)
-    return synthetic, confidence, uncertainty, prompt
+    gate = None
+    if gate_slices:
+        gate = torch.cat(gate_slices, dim=0).numpy().transpose(1, 2, 0)
+    stage1 = torch.cat(stage1_slices, dim=0).numpy().transpose(1, 2, 0)
+    return synthetic, confidence, uncertainty, prompt, gate, stage1
 
 
 def robust_limits(array: np.ndarray) -> tuple[float, float]:
@@ -333,7 +352,7 @@ def generate_slice(
     image_slice: torch.Tensor,
     base_target_index: int,
     dataset_name: str = "",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray]:
     device = next(model.parameters()).device
     image_slice = torch.nan_to_num(
         image_slice.to(device),
@@ -356,7 +375,11 @@ def generate_slice(
     uncertainty = output["uncertainty"].squeeze(0).squeeze(0).cpu().numpy()
     prompt = output.get("prompt_probs")
     prompt_np = prompt.squeeze(0).cpu().numpy() if prompt is not None else None
-    return synthetic, confidence, uncertainty, prompt_np
+    gate = output.get("refinement_gate")
+    gate_np = gate.squeeze(0).squeeze(0).cpu().numpy() if gate is not None else None
+    stage1 = output.get("stage1_synthetic", output["synthetic"])
+    stage1_np = stage1.squeeze(0).squeeze(0).cpu().numpy()
+    return synthetic, confidence, uncertainty, prompt_np, gate_np, stage1_np
 
 
 def show_slice(
@@ -438,7 +461,7 @@ def choose_cases_by_generation_error(
             real = image_np[target_index]
             z = selected_slice(seg_np, real)
             context_tensor = context_slice_tensor(image_np, z, context_radius)
-            synthetic, _, _, _ = generate_slice(
+            synthetic, _, _, _, _, _ = generate_slice(
                 model,
                 context_tensor,
                 target_index,
@@ -529,7 +552,7 @@ def main() -> int:
                 crop_seg = crop_seg_tensor.numpy()
             else:
                 crop_seg = crop_seg.astype(np.int64, copy=False)
-            synthetic_2d, confidence_2d, uncertainty_2d, prompt_2d = generate_slice(
+            synthetic_2d, confidence_2d, uncertainty_2d, prompt_2d, gate_2d, stage1_2d = generate_slice(
                 model,
                 crop_tensor,
                 target_index,
@@ -542,9 +565,11 @@ def main() -> int:
             confidence = confidence_2d[:, :, None]
             uncertainty = uncertainty_2d[:, :, None]
             prompt = prompt_2d[:, :, :, None] if prompt_2d is not None else None
+            gate = gate_2d[:, :, None] if gate_2d is not None else None
+            stage1 = stage1_2d[:, :, None]
             z = 0
         else:
-            synthetic, confidence, uncertainty, prompt = generate_volume(
+            synthetic, confidence, uncertainty, prompt, gate, stage1 = generate_volume(
                 model,
                 image,
                 target_index,
@@ -560,11 +585,16 @@ def main() -> int:
                 )
                 synthetic = synthetic * support.astype(np.float32)
                 confidence = confidence * support.astype(np.float32)
+                stage1 = stage1 * support.astype(np.float32)
                 if prompt is not None:
                     prompt = prompt * support[None].astype(np.float32)
+                if gate is not None:
+                    gate = gate * support.astype(np.float32)
             if prompt is not None:
                 prompt = prompt
         error = np.abs(synthetic - real)
+        stage1_error = np.abs(stage1 - real)
+        refinement_delta = np.abs(synthetic - stage1)
         mse = float(np.mean((synthetic - real) ** 2))
         record = {
             "dataset": row["dataset"],
@@ -576,7 +606,11 @@ def main() -> int:
             "psnr": psnr(mse),
             "confidence_mean": float(confidence.mean()),
             "uncertainty_mean": float(uncertainty.mean()),
+            "stage1_mae": float(stage1_error.mean()),
+            "refinement_delta_mean": float(refinement_delta.mean()),
         }
+        if gate is not None:
+            record["gate_mean"] = float(gate.mean())
         if crop_record is not None:
             record["crop_top"] = int(crop_record[0])
             record["crop_left"] = int(crop_record[1])
@@ -589,13 +623,16 @@ def main() -> int:
             record[f"mae_{label}"] = (
                 float(error[region_mask].mean()) if region_mask.any() else None
             )
+            record[f"stage1_mae_{label}"] = (
+                float(stage1_error[region_mask].mean()) if region_mask.any() else None
+            )
+            record[f"refinement_delta_{label}"] = (
+                float(refinement_delta[region_mask].mean()) if region_mask.any() else None
+            )
 
         lo, hi = robust_limits(real)
         error_hi = float(np.percentile(error, 99))
-        if prompt is None:
-            fig, axes = plt.subplots(2, 4, figsize=(14, 7), dpi=160)
-        else:
-            fig, axes = plt.subplots(3, 4, figsize=(14, 10), dpi=160)
+        delta_hi = float(np.percentile(refinement_delta, 99))
         input_modalities = [
             (BRATS_MODALITIES[i].upper(), image_np[i])
             for i in range(len(BRATS_MODALITIES))
@@ -604,11 +641,15 @@ def main() -> int:
         panels: list[tuple[str, np.ndarray, str, float | None, float | None]] = [
             *[(f"{name} input", volume, "gray", None, None) for name, volume in input_modalities[:3]],
             (f"Real {target_modality.upper()}", real, "gray", lo, hi),
+            (f"Stage1 {target_modality.upper()}", stage1, "gray", lo, hi),
             (f"Generated {target_modality.upper()}", synthetic, "gray", lo, hi),
             ("Abs error", error, "magma", 0.0, error_hi),
+            ("Refinement delta", refinement_delta, "magma", 0.0, delta_hi),
             ("Confidence", confidence, "viridis", 0.0, 1.0),
             ("Seg label", seg_np, "tab10", 0.0, float(max(3, int(seg_np.max())))),
         ]
+        if gate is not None:
+            panels.append(("Refinement gate", gate, "viridis", 0.0, 1.0))
         if prompt is not None:
             panels.extend(
                 [
@@ -618,8 +659,13 @@ def main() -> int:
                     ("Uncertainty", uncertainty, "viridis", None, None),
                 ]
             )
-        for axis, (title, volume, cmap, vmin, vmax) in zip(axes.ravel(), panels):
+        panel_rows = int(math.ceil(len(panels) / 4))
+        fig, axes = plt.subplots(panel_rows, 4, figsize=(14, 3.4 * panel_rows), dpi=160)
+        axes_array = np.asarray(axes).reshape(-1)
+        for axis, (title, volume, cmap, vmin, vmax) in zip(axes_array, panels):
             show_slice(axis, volume, z, title, cmap, vmin, vmax)
+        for axis in axes_array[len(panels) :]:
+            axis.axis("off")
         fig.suptitle(
             f"{row['dataset']} {row['subject_id']} | missing {target_modality.upper()} "
             f"| slice {z} | MAE={record['mae']:.4f} | PSNR={record['psnr']:.2f}",
@@ -634,15 +680,28 @@ def main() -> int:
         plt.close(fig)
         record["panel_path"] = str(panel_path.resolve())
         case_records.append(record)
-        summary_items.append((row, z, real, synthetic, error, lo, hi, error_hi))
+        summary_items.append((row, z, real, stage1, synthetic, error, gate, lo, hi, error_hi))
 
-    fig, axes = plt.subplots(len(summary_items), 3, figsize=(8.8, 2.6 * len(summary_items)), dpi=160)
+    has_gate = any(item[6] is not None for item in summary_items)
+    summary_cols = 5 if has_gate else 4
+    fig, axes = plt.subplots(
+        len(summary_items),
+        summary_cols,
+        figsize=(3.0 * summary_cols, 2.6 * len(summary_items)),
+        dpi=160,
+    )
     if len(summary_items) == 1:
         axes = np.expand_dims(axes, axis=0)
-    for row_index, (row, z, real, synthetic, error, lo, hi, error_hi) in enumerate(summary_items):
+    for row_index, (row, z, real, stage1, synthetic, error, gate, lo, hi, error_hi) in enumerate(summary_items):
         show_slice(axes[row_index, 0], real, z, f"{row['dataset']} {row['subject_id']} real", "gray", lo, hi)
-        show_slice(axes[row_index, 1], synthetic, z, "generated", "gray", lo, hi)
-        show_slice(axes[row_index, 2], error, z, "abs error", "magma", 0.0, error_hi)
+        show_slice(axes[row_index, 1], stage1, z, "stage1", "gray", lo, hi)
+        show_slice(axes[row_index, 2], synthetic, z, "generated", "gray", lo, hi)
+        show_slice(axes[row_index, 3], error, z, "abs error", "magma", 0.0, error_hi)
+        if has_gate:
+            if gate is None:
+                axes[row_index, 4].axis("off")
+            else:
+                show_slice(axes[row_index, 4], gate, z, "refinement gate", "viridis", 0.0, 1.0)
     fig.suptitle(
         f"{args.spatial_size}x{args.spatial_size} comparison: real vs generated {target_modality.upper()}",
         fontsize=12,

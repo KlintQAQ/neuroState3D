@@ -21,6 +21,9 @@ class SliceDriftTransportGeneratorConfig:
     class_channels: int = 0
     class_conditioned: bool = False
     init_blur_kernel: int = 5
+    gated_refinement: bool = False
+    refinement_residual_scale: float = 0.25
+    gate_bias_init: float = -3.0
 
 
 class SliceDriftTransportGenerator(nn.Module):
@@ -74,6 +77,17 @@ class SliceDriftTransportGenerator(nn.Module):
         self.uncertainty_head = nn.Conv2d(hidden, 1, kernel_size=1)
         nn.init.zeros_(self.velocity_head.weight)
         nn.init.zeros_(self.velocity_head.bias)
+        if self.config.gated_refinement:
+            refinement_in_channels = int(self.config.in_modalities) * 2 + 3 + class_channels
+            self.refinement_context = nn.Sequential(
+                ConvNormAct2d(refinement_in_channels, hidden),
+                ResidualConvBlock2d(hidden),
+                ConvNormAct2d(hidden, hidden),
+            )
+            self.refinement_gate_head = nn.Conv2d(hidden, 1, kernel_size=1)
+            self.refinement_residual_head = nn.Conv2d(hidden, 1, kernel_size=1)
+            nn.init.constant_(self.refinement_gate_head.bias, float(self.config.gate_bias_init))
+            nn.init.zeros_(self.refinement_residual_head.bias)
 
     def forward(
         self,
@@ -98,11 +112,12 @@ class SliceDriftTransportGenerator(nn.Module):
         states = [current]
         velocities = []
         uncertainty_raw = None
+        last_features = None
         steps = max(1, int(self.config.transport_steps))
         for step in range(steps):
             progress = float(step) / float(max(steps - 1, 1))
             remaining = float(steps - step) / float(steps)
-            velocity, uncertainty_raw = self._velocity_step(
+            velocity, uncertainty_raw, last_features = self._velocity_step(
                 current,
                 masked,
                 mask_channels,
@@ -117,13 +132,40 @@ class SliceDriftTransportGenerator(nn.Module):
             states.append(current)
         if uncertainty_raw is None:
             uncertainty_raw = torch.zeros_like(current)
+        stage1 = current
+        refinement_gate = None
+        refinement_gate_logits = None
+        refinement_residual = None
+        if self.config.gated_refinement:
+            if last_features is None:
+                raise RuntimeError("gated_refinement requires at least one transport step")
+            uncertainty_preview = F.softplus(uncertainty_raw)
+            source_energy = masked.abs().amax(dim=1, keepdim=True)
+            refinement_inputs = [
+                masked,
+                mask_channels,
+                stage1,
+                uncertainty_preview,
+                source_energy,
+            ]
+            if class_map is not None:
+                refinement_inputs.append(class_map)
+            refinement_features = self.refinement_context(torch.cat(refinement_inputs, dim=1))
+            refinement_features = refinement_features + last_features
+            refinement_gate_logits = self.refinement_gate_head(refinement_features)
+            refinement_gate = torch.sigmoid(refinement_gate_logits)
+            refinement_residual = float(self.config.refinement_residual_scale) * torch.tanh(
+                self.refinement_residual_head(refinement_features)
+            )
+            current = self._activate(stage1 + refinement_gate * refinement_residual)
         uncertainty = F.softplus(uncertainty_raw) + float(self.config.uncertainty_min)
         confidence = torch.exp(-uncertainty)
-        return {
+        output = {
             "synthetic": current,
             "uncertainty": uncertainty,
             "confidence": confidence,
             "drift_initial": states[0],
+            "stage1_synthetic": stage1,
             "drift_states": torch.stack(states, dim=1),
             "drift_velocities": torch.stack(velocities, dim=1),
             "transport_step_scale": torch.tensor(
@@ -132,6 +174,15 @@ class SliceDriftTransportGenerator(nn.Module):
                 dtype=slices.dtype,
             ),
         }
+        if refinement_gate is not None:
+            output.update(
+                {
+                    "refinement_gate": refinement_gate,
+                    "refinement_gate_logits": refinement_gate_logits,
+                    "refinement_residual": refinement_residual,
+                }
+            )
+        return output
 
     def _class_map(
         self,
@@ -186,7 +237,7 @@ class SliceDriftTransportGenerator(nn.Module):
         progress: float,
         remaining: float,
         class_map: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         b, _, h, w = current.shape
         progress_map = current.new_full((b, 1, h, w), float(progress))
         remaining_map = current.new_full((b, 1, h, w), float(remaining))
@@ -202,7 +253,7 @@ class SliceDriftTransportGenerator(nn.Module):
         x = self.up2(torch.cat([x, x0], dim=1))
         velocity = float(self.config.velocity_scale) * torch.tanh(self.velocity_head(x))
         uncertainty_raw = self.uncertainty_head(x)
-        return velocity, uncertainty_raw
+        return velocity, uncertainty_raw, x
 
     def _activate(self, image: torch.Tensor) -> torch.Tensor:
         if self.config.output_activation == "tanh":

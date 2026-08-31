@@ -137,6 +137,15 @@ STAGE2_OUTPUT_DIR="${STAGE2_OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}_transport_sta
 STAGE2_REPORT="${STAGE2_REPORT:-${REPORT_DIR}/${RUN_NAME}_transport_stage2_hard.json}"
 STAGE2_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_last.pt"
 STAGE2_BEST_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_best.pt"
+STAGE2_GATED_REFINEMENT="${STAGE2_GATED_REFINEMENT:-1}"
+STAGE2_FREEZE_TRANSPORT_BASE="${STAGE2_FREEZE_TRANSPORT_BASE:-1}"
+REFINEMENT_RESIDUAL_SCALE="${REFINEMENT_RESIDUAL_SCALE:-0.25}"
+GATE_BIAS_INIT="${GATE_BIAS_INIT:--3.0}"
+GATE_SUPERVISION_WEIGHT="${GATE_SUPERVISION_WEIGHT:-0.60}"
+GATE_SPARSITY_WEIGHT="${GATE_SPARSITY_WEIGHT:-0.08}"
+BACKGROUND_PRESERVE_WEIGHT="${BACKGROUND_PRESERVE_WEIGHT:-0.60}"
+CORE_OVERFILL_WEIGHT="${CORE_OVERFILL_WEIGHT:-0.25}"
+GATE_TARGET_DILATION="${GATE_TARGET_DILATION:-2}"
 
 VIS_NUM_CASES="${VIS_NUM_CASES:-12}"
 VIS_CASE_SELECTION="${VIS_CASE_SELECTION:-representative}"
@@ -597,6 +606,22 @@ train_transport_stage2_hard() {
     stage_log "Stage-2 checkpoint/report exist; skipping hard fine-tune."
     return
   fi
+  local stage2_extra_args=()
+  if [[ "${STAGE2_GATED_REFINEMENT}" == "1" ]]; then
+    stage2_extra_args+=(
+      --gated-refinement
+      --refinement-residual-scale "${REFINEMENT_RESIDUAL_SCALE}"
+      --gate-bias-init "${GATE_BIAS_INIT}"
+      --gate-supervision-weight "${GATE_SUPERVISION_WEIGHT}"
+      --gate-sparsity-weight "${GATE_SPARSITY_WEIGHT}"
+      --background-preserve-weight "${BACKGROUND_PRESERVE_WEIGHT}"
+      --core-overfill-weight "${CORE_OVERFILL_WEIGHT}"
+      --gate-target-dilation "${GATE_TARGET_DILATION}"
+    )
+    if [[ "${STAGE2_FREEZE_TRANSPORT_BASE}" == "1" ]]; then
+      stage2_extra_args+=(--freeze-base-generator)
+    fi
+  fi
   run_stage train_transport_stage2_hard \
     python scripts/train_slice_virtual_modality_drifting.py \
       --manifest "${MANIFEST}" \
@@ -618,6 +643,7 @@ train_transport_stage2_hard() {
       --batch-size "${BATCH_SIZE}" \
       --num-workers "${NUM_WORKERS}" \
       --hidden-channels "${HIDDEN_CHANNELS}" \
+      "${stage2_extra_args[@]}" \
       --output-activation hardtanh \
       --transport-steps "${TRANSPORT_STEPS}" \
       --transport-step-scale "${TRANSPORT_STEP_SCALE}" \
