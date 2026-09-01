@@ -28,6 +28,7 @@ class SliceDriftTransportGeneratorConfig:
     accept_bias_init: float = -2.0
     refinement_channels_multiplier: int = 1
     refinement_blocks: int = 1
+    refinement_detail_features: bool = False
 
 
 class SliceDriftTransportGenerator(nn.Module):
@@ -82,7 +83,8 @@ class SliceDriftTransportGenerator(nn.Module):
         nn.init.zeros_(self.velocity_head.weight)
         nn.init.zeros_(self.velocity_head.bias)
         if self.config.gated_refinement:
-            refinement_in_channels = int(self.config.in_modalities) * 2 + 3 + class_channels
+            detail_channels = 8 if bool(self.config.refinement_detail_features) else 0
+            refinement_in_channels = int(self.config.in_modalities) * 2 + 3 + class_channels + detail_channels
             refinement_hidden = hidden * max(1, int(self.config.refinement_channels_multiplier))
             refinement_blocks = max(1, int(self.config.refinement_blocks))
             refinement_layers: list[nn.Module] = [ConvNormAct2d(refinement_in_channels, refinement_hidden)]
@@ -172,6 +174,10 @@ class SliceDriftTransportGenerator(nn.Module):
             ]
             if class_map is not None:
                 refinement_inputs.append(class_map)
+            if bool(self.config.refinement_detail_features):
+                refinement_inputs.append(
+                    self._refinement_detail_features(masked, mask_channels, stage1, source_energy)
+                )
             refinement_features = self.refinement_context(torch.cat(refinement_inputs, dim=1))
             refinement_features = refinement_features + self.refinement_feature_project(last_features)
             refinement_gate_logits = self.refinement_gate_head(refinement_features)
@@ -289,6 +295,57 @@ class SliceDriftTransportGenerator(nn.Module):
         velocity = float(self.config.velocity_scale) * torch.tanh(self.velocity_head(x))
         uncertainty_raw = self.uncertainty_head(x)
         return velocity, uncertainty_raw, x
+
+    def _refinement_detail_features(
+        self,
+        masked: torch.Tensor,
+        mask_channels: torch.Tensor,
+        stage1: torch.Tensor,
+        source_energy: torch.Tensor,
+    ) -> torch.Tensor:
+        observed_count = mask_channels.sum(dim=1, keepdim=True).clamp_min(1.0)
+        source_mean = masked.sum(dim=1, keepdim=True) / observed_count
+        source_second = masked.square().sum(dim=1, keepdim=True) / observed_count
+        source_std = (source_second - source_mean.square()).clamp_min(1e-6).sqrt()
+        source_local_mean = F.avg_pool2d(source_mean, kernel_size=5, stride=1, padding=2)
+        source_local_second = F.avg_pool2d(source_mean.square(), kernel_size=5, stride=1, padding=2)
+        source_local_std = (source_local_second - source_local_mean.square()).clamp_min(1e-6).sqrt()
+        source_edge, source_laplace = self._edge_laplace(source_mean)
+        stage1_edge, stage1_laplace = self._edge_laplace(stage1)
+        return torch.cat(
+            [
+                source_mean,
+                source_std,
+                source_energy,
+                source_local_std,
+                source_edge,
+                source_laplace.abs(),
+                stage1_edge,
+                stage1_laplace.abs(),
+            ],
+            dim=1,
+        )
+
+    @staticmethod
+    def _edge_laplace(image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        dtype = image.dtype
+        device = image.device
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            dtype=dtype,
+            device=device,
+        ).view(1, 1, 3, 3) / 8.0
+        sobel_y = sobel_x.transpose(2, 3)
+        laplace = torch.tensor(
+            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+            dtype=dtype,
+            device=device,
+        ).view(1, 1, 3, 3) / 4.0
+        grad_x = F.conv2d(image, sobel_x, padding=1)
+        grad_y = F.conv2d(image, sobel_y, padding=1)
+        edge = (grad_x.square() + grad_y.square() + 1e-8).sqrt()
+        lap = F.conv2d(image, laplace, padding=1)
+        return edge, lap
 
     def _activate(self, image: torch.Tensor) -> torch.Tensor:
         if self.config.output_activation == "tanh":

@@ -62,11 +62,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slices-per-subject", type=int, default=4)
     parser.add_argument("--slice-context-radius", type=int, default=0)
     parser.add_argument("--slice-crop-size", type=int, default=0)
+    parser.add_argument("--val-slice-crop-size", type=int, default=-1)
     parser.add_argument("--slice-crop-jitter", type=int, default=8)
     parser.add_argument(
         "--slice-crop-mode",
         default="none",
         choices=("none", "region_balanced"),
+    )
+    parser.add_argument(
+        "--val-slice-crop-mode",
+        default="",
+        choices=("", "none", "region_balanced"),
     )
     parser.add_argument("--hard-slice-json", default="")
     parser.add_argument("--hard-slice-prob", type=float, default=0.0)
@@ -77,7 +83,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--model-kind", default="slice", choices=("slice", "prompted", "transport"))
-    parser.add_argument("--best-metric", default="mae", choices=("mae", "lesion_composite"))
+    parser.add_argument(
+        "--best-metric",
+        default="mae",
+        choices=("mae", "lesion_composite", "lesion_noharm_composite"),
+    )
     parser.add_argument("--freeze-base-generator", action="store_true")
     parser.add_argument("--detail-only-refinement", action="store_true")
     parser.add_argument("--train-prompt-with-detail", action="store_true")
@@ -96,8 +106,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--accept-bias-init", type=float, default=-2.0)
     parser.add_argument("--refinement-channels-multiplier", type=int, default=1)
     parser.add_argument("--refinement-blocks", type=int, default=1)
+    parser.add_argument("--refinement-detail-features", action="store_true")
     parser.add_argument("--gate-supervision-weight", type=float, default=0.0)
     parser.add_argument("--gate-target-dilation", type=int, default=2)
+    parser.add_argument("--residual-need-gate-weight", type=float, default=0.0)
+    parser.add_argument("--residual-need-gate-threshold", type=float, default=0.05)
     parser.add_argument("--gate-sparsity-weight", type=float, default=0.0)
     parser.add_argument("--background-preserve-weight", type=float, default=0.0)
     parser.add_argument("--core-overfill-weight", type=float, default=0.0)
@@ -899,6 +912,39 @@ def lesion_gate_supervision_loss(
         pos_weight=pos_weight,
     )
     return bce.mean()
+
+
+def residual_need_gate_supervision_loss(
+    generated: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    target_regions: torch.Tensor,
+    dilation: int,
+    error_threshold: float,
+    max_pos_weight: float = 20.0,
+) -> torch.Tensor:
+    if "refinement_gate_logits" not in generated or "stage1_synthetic" not in generated:
+        return target.new_zeros(())
+    logits = generated["refinement_gate_logits"]
+    stage1 = generated["stage1_synthetic"].detach()
+    lesion = lesion_refinement_target(target_regions, dilation).to(
+        device=target.device,
+        dtype=target.dtype,
+    )
+    threshold = max(float(error_threshold), 1e-6)
+    residual_need = (target - stage1).abs().detach()
+    target_gate = (residual_need / threshold).clamp(0.0, 1.0) * lesion
+    positive_fraction = target_gate.detach().mean().clamp_min(1e-4)
+    pos_weight = ((1.0 - positive_fraction) / positive_fraction).clamp(
+        min=1.0,
+        max=float(max_pos_weight),
+    )
+    loss = F.binary_cross_entropy_with_logits(
+        logits,
+        target_gate,
+        reduction="none",
+        pos_weight=pos_weight,
+    )
+    return loss.mean()
 
 
 def refinement_gate_sparsity_loss(
@@ -2016,6 +2062,17 @@ def loss_for_batch(
         if float(args.gate_supervision_weight) > 0.0
         else synthetic.new_zeros(())
     )
+    residual_need_gate = (
+        residual_need_gate_supervision_loss(
+            generated,
+            target,
+            batch["target_regions"],
+            args.gate_target_dilation,
+            args.residual_need_gate_threshold,
+        )
+        if float(args.residual_need_gate_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
     gate_sparsity = (
         refinement_gate_sparsity_loss(
             generated,
@@ -2201,6 +2258,7 @@ def loss_for_batch(
         + float(args.lesion_boundary_weight) * lesion_boundary
         + float(args.enhancement_contrast_weight) * enhancement_contrast
         + float(args.gate_supervision_weight) * gate_supervision
+        + float(args.residual_need_gate_weight) * residual_need_gate
         + float(args.gate_sparsity_weight) * gate_sparsity
         + float(args.background_preserve_weight) * background_preserve
         + float(args.core_overfill_weight) * core_overfill
@@ -2244,6 +2302,7 @@ def loss_for_batch(
         "lesion_boundary": float(lesion_boundary.detach().cpu().item()),
         "enhancement_contrast": float(enhancement_contrast.detach().cpu().item()),
         "gate_supervision": float(gate_supervision.detach().cpu().item()),
+        "residual_need_gate": float(residual_need_gate.detach().cpu().item()),
         "gate_sparsity": float(gate_sparsity.detach().cpu().item()),
         "background_preserve": float(background_preserve.detach().cpu().item()),
         "core_overfill": float(core_overfill.detach().cpu().item()),
@@ -2351,7 +2410,28 @@ def evaluate(
         }
         if "stage1_synthetic" in generated:
             stage1_error = (generated["stage1_synthetic"] - target).abs()
+            stage1_under = F.relu(target - generated["stage1_synthetic"])
             row["stage1_mae"] = float(stage1_error.mean().cpu().item())
+            row["stage1_high_tumor_mae"] = (
+                float(stage1_error[high_tumor].mean().cpu().item())
+                if high_tumor.any()
+                else float("nan")
+            )
+            row["stage1_high_tumor_under"] = (
+                float(stage1_under[high_tumor].mean().cpu().item())
+                if high_tumor.any()
+                else float("nan")
+            )
+            row["high_tumor_mae_delta_from_stage1"] = (
+                row["high_tumor_mae"] - row["stage1_high_tumor_mae"]
+                if high_tumor.any()
+                else float("nan")
+            )
+            row["high_tumor_under_delta_from_stage1"] = (
+                row["high_tumor_under"] - row["stage1_high_tumor_under"]
+                if high_tumor.any()
+                else float("nan")
+            )
             harm_map = (error > stage1_error + 1e-4).float()
             improvement_map = (error + 1e-4 < stage1_error).float()
             applied_delta = (synthetic - generated["stage1_synthetic"]).abs()
@@ -2442,6 +2522,15 @@ def evaluate(
             row[f"mae_{region}"] = (
                 float(error[mask].mean().cpu().item()) if mask.any() else float("nan")
             )
+            if "stage1_synthetic" in generated:
+                row[f"stage1_mae_{region}"] = (
+                    float(stage1_error[mask].mean().cpu().item()) if mask.any() else float("nan")
+                )
+                row[f"mae_{region}_delta_from_stage1"] = (
+                    row[f"mae_{region}"] - row[f"stage1_mae_{region}"]
+                    if mask.any()
+                    else float("nan")
+                )
             row[f"ssim_{region}"] = (
                 float(ssim_map[mask].mean().cpu().item()) if mask.any() else float("nan")
             )
@@ -2473,7 +2562,7 @@ def eval_metric(metrics: dict[str, float], key: str, default: float = float("inf
 def selection_score(metrics: dict[str, float], mode: str) -> float:
     if mode == "mae":
         return eval_metric(metrics, "mae")
-    if mode != "lesion_composite":
+    if mode not in {"lesion_composite", "lesion_noharm_composite"}:
         raise ValueError(f"Unknown best metric: {mode}")
     mae = eval_metric(metrics, "mae")
     if not math.isfinite(mae):
@@ -2505,6 +2594,26 @@ def selection_score(metrics: dict[str, float], mode: str) -> float:
         + 0.04 * ssim_penalty
         + 0.04 * float(lesion_ssim_penalty)
     )
+    if mode == "lesion_noharm_composite":
+        stage1_mae = eval_metric(metrics, "stage1_mae", mae)
+        whole_regression = max(0.0, mae - stage1_mae)
+        et_regression = max(0.0, eval_metric(metrics, "mae_ET_delta_from_stage1", 0.0))
+        tc_regression = max(0.0, eval_metric(metrics, "mae_TC_delta_from_stage1", 0.0))
+        wt_regression = max(0.0, eval_metric(metrics, "mae_WT_delta_from_stage1", 0.0))
+        high_regression = max(
+            0.0,
+            eval_metric(metrics, "high_tumor_mae_delta_from_stage1", 0.0),
+        )
+        score = (
+            score
+            + 0.40 * whole_regression
+            + 0.24 * high_regression
+            + 0.18 * et_regression
+            + 0.12 * tc_regression
+            + 0.08 * wt_regression
+            + 0.14 * eval_metric(metrics, "background_harm_rate", 0.0)
+            + 0.10 * eval_metric(metrics, "background_delta_from_stage1", 0.0)
+        )
     return float(score)
 
 
@@ -2609,6 +2718,7 @@ def build_model(
                 accept_bias_init=args.accept_bias_init,
                 refinement_channels_multiplier=args.refinement_channels_multiplier,
                 refinement_blocks=args.refinement_blocks,
+                refinement_detail_features=args.refinement_detail_features,
             )
         )
     return SliceVirtualModalityGenerator(
@@ -2938,6 +3048,16 @@ def main() -> int:
         args.hard_slice_min_score,
         args.hard_slice_top_k,
     )
+    val_slice_crop_size = (
+        int(args.slice_crop_size)
+        if int(args.val_slice_crop_size) < 0
+        else int(args.val_slice_crop_size)
+    )
+    val_slice_crop_mode = (
+        str(args.slice_crop_mode)
+        if not str(args.val_slice_crop_mode)
+        else str(args.val_slice_crop_mode)
+    )
     split_dataset = BraTSSliceDataset(
         args.manifest,
         spatial_size=args.spatial_size,
@@ -2945,9 +3065,9 @@ def main() -> int:
         slices_per_subject=args.slices_per_subject,
         target_modality=args.target_modality,
         seed=args.seed,
-        slice_crop_size=args.slice_crop_size,
+        slice_crop_size=val_slice_crop_size,
         slice_crop_jitter=args.slice_crop_jitter,
-        slice_crop_mode=args.slice_crop_mode,
+        slice_crop_mode=val_slice_crop_mode,
         slice_context_radius=args.slice_context_radius,
     )
     train_dataset = BraTSSliceDataset(
@@ -3105,6 +3225,10 @@ def main() -> int:
         "git_commit": git_commit(),
         "environment": environment(args.device),
         "config": vars(args),
+        "derived_config": {
+            "val_slice_crop_size": val_slice_crop_size,
+            "val_slice_crop_mode": val_slice_crop_mode,
+        },
         "resume": resume_report,
         "lesion_residual_head_reset": lesion_reset,
         "freeze": freeze_report,

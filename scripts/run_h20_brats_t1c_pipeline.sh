@@ -87,9 +87,11 @@ SPATIAL_SIZE="${SPATIAL_SIZE:-128}"
 MAX_SUBJECTS="${MAX_SUBJECTS:-0}"          # 0 means all subjects in the training script.
 VAL_SUBJECTS="${VAL_SUBJECTS:-128}"
 SLICES_PER_SUBJECT="${SLICES_PER_SUBJECT:-32}"
-SLICE_CONTEXT_RADIUS="${SLICE_CONTEXT_RADIUS:-0}"
+SLICE_CONTEXT_RADIUS="${SLICE_CONTEXT_RADIUS:-1}"
 SLICE_CROP_SIZE="${SLICE_CROP_SIZE:-64}"
 SLICE_CROP_JITTER="${SLICE_CROP_JITTER:-6}"
+VAL_SLICE_CROP_SIZE="${VAL_SLICE_CROP_SIZE:--1}"
+VAL_SLICE_CROP_MODE="${VAL_SLICE_CROP_MODE:-}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 LOG_EVERY="${LOG_EVERY:-100}"
@@ -134,7 +136,9 @@ MINE_MAX_SUBJECTS="${MINE_MAX_SUBJECTS:-0}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-6}"
 STAGE2_LR="${STAGE2_LR:-5e-5}"
 STAGE2_SLICE_CROP_SIZE="${STAGE2_SLICE_CROP_SIZE:-96}"
-STAGE2_BEST_METRIC="${STAGE2_BEST_METRIC:-lesion_composite}"
+STAGE2_VAL_SLICE_CROP_SIZE="${STAGE2_VAL_SLICE_CROP_SIZE:-0}"
+STAGE2_VAL_SLICE_CROP_MODE="${STAGE2_VAL_SLICE_CROP_MODE:-none}"
+STAGE2_BEST_METRIC="${STAGE2_BEST_METRIC:-lesion_noharm_composite}"
 STAGE2_OUTPUT_DIR="${STAGE2_OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}_transport_stage2_noharm}"
 STAGE2_REPORT="${STAGE2_REPORT:-${REPORT_DIR}/${RUN_NAME}_transport_stage2_noharm.json}"
 STAGE2_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_last.pt"
@@ -142,14 +146,17 @@ STAGE2_BEST_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_be
 STAGE2_GATED_REFINEMENT="${STAGE2_GATED_REFINEMENT:-1}"
 STAGE2_FREEZE_TRANSPORT_BASE="${STAGE2_FREEZE_TRANSPORT_BASE:-1}"
 STAGE2_REFINEMENT_ACCEPTANCE_GATE="${STAGE2_REFINEMENT_ACCEPTANCE_GATE:-1}"
-STAGE2_REFINEMENT_CHANNELS_MULTIPLIER="${STAGE2_REFINEMENT_CHANNELS_MULTIPLIER:-2}"
-STAGE2_REFINEMENT_BLOCKS="${STAGE2_REFINEMENT_BLOCKS:-4}"
-REFINEMENT_RESIDUAL_SCALE="${REFINEMENT_RESIDUAL_SCALE:-0.18}"
+STAGE2_REFINEMENT_DETAIL_FEATURES="${STAGE2_REFINEMENT_DETAIL_FEATURES:-1}"
+STAGE2_REFINEMENT_CHANNELS_MULTIPLIER="${STAGE2_REFINEMENT_CHANNELS_MULTIPLIER:-3}"
+STAGE2_REFINEMENT_BLOCKS="${STAGE2_REFINEMENT_BLOCKS:-5}"
+REFINEMENT_RESIDUAL_SCALE="${REFINEMENT_RESIDUAL_SCALE:-0.28}"
 GATE_BIAS_INIT="${GATE_BIAS_INIT:--3.0}"
 ACCEPT_BIAS_INIT="${ACCEPT_BIAS_INIT:--2.0}"
-GATE_SUPERVISION_WEIGHT="${GATE_SUPERVISION_WEIGHT:-0.60}"
+GATE_SUPERVISION_WEIGHT="${GATE_SUPERVISION_WEIGHT:-0.45}"
+RESIDUAL_NEED_GATE_WEIGHT="${RESIDUAL_NEED_GATE_WEIGHT:-0.55}"
+RESIDUAL_NEED_GATE_THRESHOLD="${RESIDUAL_NEED_GATE_THRESHOLD:-0.035}"
 GATE_SPARSITY_WEIGHT="${GATE_SPARSITY_WEIGHT:-0.08}"
-BACKGROUND_PRESERVE_WEIGHT="${BACKGROUND_PRESERVE_WEIGHT:-0.60}"
+BACKGROUND_PRESERVE_WEIGHT="${BACKGROUND_PRESERVE_WEIGHT:-0.70}"
 CORE_OVERFILL_WEIGHT="${CORE_OVERFILL_WEIGHT:-0.25}"
 MULTISCALE_SSIM_WEIGHT="${MULTISCALE_SSIM_WEIGHT:-0.04}"
 LESION_MULTISCALE_SSIM_WEIGHT="${LESION_MULTISCALE_SSIM_WEIGHT:-0.12}"
@@ -164,13 +171,13 @@ MICRO_WINDOW_SIZES="${MICRO_WINDOW_SIZES:-3 5 7}"
 MICRO_WINDOW_STRIDE="${MICRO_WINDOW_STRIDE:-2}"
 ACCEPTANCE_SUPERVISION_WEIGHT="${ACCEPTANCE_SUPERVISION_WEIGHT:-0.25}"
 ACCEPTANCE_ERROR_THRESHOLD="${ACCEPTANCE_ERROR_THRESHOLD:-0.04}"
-REFINEMENT_RESIDUAL_TARGET_WEIGHT="${REFINEMENT_RESIDUAL_TARGET_WEIGHT:-0.25}"
-REFINEMENT_DIRECTION_WEIGHT="${REFINEMENT_DIRECTION_WEIGHT:-0.08}"
-REFINEMENT_RESIDUAL_BUDGET_WEIGHT="${REFINEMENT_RESIDUAL_BUDGET_WEIGHT:-0.35}"
-REFINEMENT_LESION_BUDGET_WEIGHT="${REFINEMENT_LESION_BUDGET_WEIGHT:-0.55}"
-REFINEMENT_NO_HARM_WEIGHT="${REFINEMENT_NO_HARM_WEIGHT:-0.40}"
-REFINEMENT_LESION_NO_HARM_WEIGHT="${REFINEMENT_LESION_NO_HARM_WEIGHT:-0.80}"
-REFINEMENT_BACKGROUND_NO_HARM_WEIGHT="${REFINEMENT_BACKGROUND_NO_HARM_WEIGHT:-0.30}"
+REFINEMENT_RESIDUAL_TARGET_WEIGHT="${REFINEMENT_RESIDUAL_TARGET_WEIGHT:-0.45}"
+REFINEMENT_DIRECTION_WEIGHT="${REFINEMENT_DIRECTION_WEIGHT:-0.16}"
+REFINEMENT_RESIDUAL_BUDGET_WEIGHT="${REFINEMENT_RESIDUAL_BUDGET_WEIGHT:-0.25}"
+REFINEMENT_LESION_BUDGET_WEIGHT="${REFINEMENT_LESION_BUDGET_WEIGHT:-0.30}"
+REFINEMENT_NO_HARM_WEIGHT="${REFINEMENT_NO_HARM_WEIGHT:-0.25}"
+REFINEMENT_LESION_NO_HARM_WEIGHT="${REFINEMENT_LESION_NO_HARM_WEIGHT:-0.45}"
+REFINEMENT_BACKGROUND_NO_HARM_WEIGHT="${REFINEMENT_BACKGROUND_NO_HARM_WEIGHT:-0.50}"
 REFINEMENT_NO_HARM_MARGIN="${REFINEMENT_NO_HARM_MARGIN:-0.0}"
 GATE_TARGET_DILATION="${GATE_TARGET_DILATION:-2}"
 
@@ -395,8 +402,10 @@ train_base_if_needed() {
     --slices-per-subject "${SLICES_PER_SUBJECT}"
     --slice-context-radius "${SLICE_CONTEXT_RADIUS}"
     --slice-crop-size "${SLICE_CROP_SIZE}"
+    --val-slice-crop-size "${VAL_SLICE_CROP_SIZE}"
     --slice-crop-jitter "${SLICE_CROP_JITTER}"
     --slice-crop-mode region_balanced
+    --val-slice-crop-mode "${VAL_SLICE_CROP_MODE}"
     --epochs "${BASE_EPOCHS}"
     --max-train-steps "${BASE_MAX_TRAIN_STEPS}"
     --batch-size "${BATCH_SIZE}"
@@ -466,8 +475,10 @@ train_enhancement() {
     --slices-per-subject "${SLICES_PER_SUBJECT}"
     --slice-context-radius "${SLICE_CONTEXT_RADIUS}"
     --slice-crop-size "${SLICE_CROP_SIZE}"
+    --val-slice-crop-size "${VAL_SLICE_CROP_SIZE}"
     --slice-crop-jitter "${SLICE_CROP_JITTER}"
     --slice-crop-mode region_balanced
+    --val-slice-crop-mode "${VAL_SLICE_CROP_MODE}"
     --epochs "${EPOCHS}"
     --max-train-steps "${MAX_TRAIN_STEPS}"
     --batch-size "${BATCH_SIZE}"
@@ -543,8 +554,10 @@ train_transport() {
     --slices-per-subject "${SLICES_PER_SUBJECT}"
     --slice-context-radius "${SLICE_CONTEXT_RADIUS}"
     --slice-crop-size "${SLICE_CROP_SIZE}"
+    --val-slice-crop-size "${VAL_SLICE_CROP_SIZE}"
     --slice-crop-jitter "${SLICE_CROP_JITTER}"
     --slice-crop-mode region_balanced
+    --val-slice-crop-mode "${VAL_SLICE_CROP_MODE}"
     --epochs "${EPOCHS}"
     --max-train-steps "${MAX_TRAIN_STEPS}"
     --batch-size "${BATCH_SIZE}"
@@ -649,6 +662,8 @@ train_transport_stage2_noharm() {
       --background-preserve-weight "${BACKGROUND_PRESERVE_WEIGHT}"
       --core-overfill-weight "${CORE_OVERFILL_WEIGHT}"
       --gate-target-dilation "${GATE_TARGET_DILATION}"
+      --residual-need-gate-weight "${RESIDUAL_NEED_GATE_WEIGHT}"
+      --residual-need-gate-threshold "${RESIDUAL_NEED_GATE_THRESHOLD}"
       --acceptance-supervision-weight "${ACCEPTANCE_SUPERVISION_WEIGHT}"
       --acceptance-error-threshold "${ACCEPTANCE_ERROR_THRESHOLD}"
       --refinement-residual-target-weight "${REFINEMENT_RESIDUAL_TARGET_WEIGHT}"
@@ -662,6 +677,9 @@ train_transport_stage2_noharm() {
     )
     if [[ "${STAGE2_REFINEMENT_ACCEPTANCE_GATE}" == "1" ]]; then
       stage2_extra_args+=(--refinement-acceptance-gate --accept-bias-init "${ACCEPT_BIAS_INIT}")
+    fi
+    if [[ "${STAGE2_REFINEMENT_DETAIL_FEATURES}" == "1" ]]; then
+      stage2_extra_args+=(--refinement-detail-features)
     fi
     if [[ "${STAGE2_FREEZE_TRANSPORT_BASE}" == "1" ]]; then
       stage2_extra_args+=(--freeze-base-generator)
@@ -680,8 +698,10 @@ train_transport_stage2_noharm() {
       --slices-per-subject "${SLICES_PER_SUBJECT}" \
       --slice-context-radius "${SLICE_CONTEXT_RADIUS}" \
       --slice-crop-size "${STAGE2_SLICE_CROP_SIZE}" \
+      --val-slice-crop-size "${STAGE2_VAL_SLICE_CROP_SIZE}" \
       --slice-crop-jitter "${SLICE_CROP_JITTER}" \
       --slice-crop-mode region_balanced \
+      --val-slice-crop-mode "${STAGE2_VAL_SLICE_CROP_MODE}" \
       --hard-slice-json "${HARD_SLICE_JSON}" \
       --hard-slice-prob "${HARD_SLICE_PROB}" \
       --hard-slice-top-k "${HARD_SLICE_TOP_K}" \
@@ -720,18 +740,18 @@ train_transport_stage2_noharm() {
       --medical-drift-memory-tokens 64 \
       --medical-drift-max-current-tokens 192 \
       --medical-drift-max-add-tokens 768 \
-      --lesion-texture-weight 0.24 \
-      --region-moment-weight 0.06 \
-      --edge-weight 0.14 \
-      --enhancement-under-weight 0.45 \
-      --lesion-boundary-weight 0.28 \
-      --enhancement-contrast-weight 0.18 \
-      --top-intensity-weight 0.45 \
+      --lesion-texture-weight 0.30 \
+      --region-moment-weight 0.08 \
+      --edge-weight 0.18 \
+      --enhancement-under-weight 0.60 \
+      --lesion-boundary-weight 0.34 \
+      --enhancement-contrast-weight 0.24 \
+      --top-intensity-weight 0.55 \
       --top-intensity-quantile 0.72 \
       --focus-dilation 3 \
       --focus-base 0.08 \
-      --focus-et 30 \
-      --focus-tc 10 \
+      --focus-et 36 \
+      --focus-tc 12 \
       --focus-wt 0.25 \
       --background-weight 0.001 \
       --resume-checkpoint "${source_checkpoint}" \

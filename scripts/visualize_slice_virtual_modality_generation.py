@@ -133,6 +133,9 @@ def load_model(
                     config.get("refinement_channels_multiplier", 1)
                 ),
                 refinement_blocks=int(config.get("refinement_blocks", 1)),
+                refinement_detail_features=bool(
+                    config.get("refinement_detail_features", False)
+                ),
             )
         )
     else:
