@@ -95,6 +95,7 @@ VAL_SLICE_CROP_MODE="${VAL_SLICE_CROP_MODE:-}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 LOG_EVERY="${LOG_EVERY:-100}"
+STEP_CHECKPOINT_EVERY="${STEP_CHECKPOINT_EVERY:-0}"
 SEED="${SEED:-46}"
 SPLIT_SEED="${SPLIT_SEED:-4601}"
 HIDDEN_CHANNELS="${HIDDEN_CHANNELS:-32}"
@@ -106,6 +107,7 @@ BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-${OUTPUT_ROOT}/h20_prompted_base_t1c_128}"
 BASE_REPORT="${BASE_REPORT:-${REPORT_DIR}/${RUN_NAME}_base.json}"
 BASE_CHECKPOINT="${BASE_CHECKPOINT:-${BASE_OUTPUT_DIR}/slice_virtual_modality_generator_last.pt}"
 BASE_RESUME_CHECKPOINT="${BASE_RESUME_CHECKPOINT:-}"
+BASE_STEP_CHECKPOINT="${BASE_OUTPUT_DIR}/slice_virtual_modality_generator_step.pt"
 FORCE_BASE_TRAIN="${FORCE_BASE_TRAIN:-0}"
 
 EPOCHS="${EPOCHS:-12}"
@@ -115,6 +117,8 @@ FINAL_OUTPUT_DIR="${FINAL_OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}_transport}"
 FINAL_REPORT="${FINAL_REPORT:-${REPORT_DIR}/${RUN_NAME}_transport.json}"
 FINAL_CHECKPOINT="${FINAL_OUTPUT_DIR}/slice_virtual_modality_generator_last.pt"
 FINAL_BEST_CHECKPOINT="${FINAL_OUTPUT_DIR}/slice_virtual_modality_generator_best.pt"
+FINAL_STEP_CHECKPOINT="${FINAL_OUTPUT_DIR}/slice_virtual_modality_generator_step.pt"
+TRANSPORT_RESUME_CHECKPOINT="${TRANSPORT_RESUME_CHECKPOINT:-}"
 FORCE_FINETUNE="${FORCE_FINETUNE:-0}"
 TRAIN_PROMPT_WITH_DETAIL="${TRAIN_PROMPT_WITH_DETAIL:-0}"
 TRAIN_PROMPTED_BASELINE="${TRAIN_PROMPTED_BASELINE:-0}"
@@ -125,8 +129,25 @@ TRANSPORT_INIT_BLUR_KERNEL="${TRANSPORT_INIT_BLUR_KERNEL:-5}"
 TRANSPORT_VELOCITY_WEIGHT="${TRANSPORT_VELOCITY_WEIGHT:-0.55}"
 TRANSPORT_PATH_WEIGHT="${TRANSPORT_PATH_WEIGHT:-0.25}"
 TRANSPORT_MONOTONIC_WEIGHT="${TRANSPORT_MONOTONIC_WEIGHT:-0.08}"
+TRANSPORT_BEST_METRIC="${TRANSPORT_BEST_METRIC:-lesion_noharm_composite}"
+TRANSPORT_PROMPT_WEIGHT="${TRANSPORT_PROMPT_WEIGHT:-0.08}"
+TRANSPORT_PROMPT_BALANCED_BCE_WEIGHT="${TRANSPORT_PROMPT_BALANCED_BCE_WEIGHT:-0.04}"
+TARGET_AWARE_MEDICAL_DEFAULTS="${TARGET_AWARE_MEDICAL_DEFAULTS:-1}"
+CLASS_CONDITIONED="${CLASS_CONDITIONED:-1}"
+MEDICAL_ROLE_CONDITIONING="${MEDICAL_ROLE_CONDITIONING:-1}"
+LEARNED_INITIAL_STATE="${LEARNED_INITIAL_STATE:-1}"
+MEDICAL_PROMPT_CONDITIONING="${MEDICAL_PROMPT_CONDITIONING:-1}"
+ROLE_HIDDEN_CHANNELS="${ROLE_HIDDEN_CHANNELS:-0}"
+INITIAL_RESIDUAL_SCALE="${INITIAL_RESIDUAL_SCALE:-0.30}"
+MEDICAL_PROMPT_CHANNELS="${MEDICAL_PROMPT_CHANNELS:-6}"
+MEDICAL_PROMPT_AUX_WEIGHT="${MEDICAL_PROMPT_AUX_WEIGHT:-0.03}"
+SLICE_SAMPLING_MODE="${SLICE_SAMPLING_MODE:-medical_mixed}"
+MIXED_BACKGROUND_PROB="${MIXED_BACKGROUND_PROB:-0.06}"
+MIXED_ET_PROB="${MIXED_ET_PROB:-0.34}"
+MIXED_TC_PROB="${MIXED_TC_PROB:-0.25}"
+MIXED_WT_PROB="${MIXED_WT_PROB:-0.25}"
 
-TRAIN_STAGE2_HARD="${TRAIN_STAGE2_HARD:-1}"
+TRAIN_STAGE2_HARD="${TRAIN_STAGE2_HARD:-0}"
 HARD_SLICE_JSON="${HARD_SLICE_JSON:-${REPORT_DIR}/${RUN_NAME}_hard_slices.json}"
 HARD_SLICE_PROB="${HARD_SLICE_PROB:-0.75}"
 HARD_SLICE_TOP_K="${HARD_SLICE_TOP_K:-3}"
@@ -143,6 +164,8 @@ STAGE2_OUTPUT_DIR="${STAGE2_OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}_transport_sta
 STAGE2_REPORT="${STAGE2_REPORT:-${REPORT_DIR}/${RUN_NAME}_transport_stage2_noharm.json}"
 STAGE2_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_last.pt"
 STAGE2_BEST_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_best.pt"
+STAGE2_STEP_CHECKPOINT="${STAGE2_OUTPUT_DIR}/slice_virtual_modality_generator_step.pt"
+STAGE2_RESUME_CHECKPOINT="${STAGE2_RESUME_CHECKPOINT:-}"
 STAGE2_GATED_REFINEMENT="${STAGE2_GATED_REFINEMENT:-1}"
 STAGE2_FREEZE_TRANSPORT_BASE="${STAGE2_FREEZE_TRANSPORT_BASE:-1}"
 STAGE2_REFINEMENT_ACCEPTANCE_GATE="${STAGE2_REFINEMENT_ACCEPTANCE_GATE:-1}"
@@ -389,6 +412,11 @@ train_base_if_needed() {
     stage_log "Base checkpoint exists; skipping base training: ${BASE_CHECKPOINT}"
     return
   fi
+  local base_resume_checkpoint="${BASE_RESUME_CHECKPOINT}"
+  if [[ -z "${base_resume_checkpoint}" && -f "${BASE_STEP_CHECKPOINT}" ]]; then
+    base_resume_checkpoint="${BASE_STEP_CHECKPOINT}"
+    stage_log "Resuming base training from step checkpoint: ${base_resume_checkpoint}"
+  fi
 
   local base_args=(
     python scripts/train_slice_virtual_modality_drifting.py
@@ -442,12 +470,13 @@ train_base_if_needed() {
     --seed "${SEED}"
     --split-seed "${SPLIT_SEED}"
     --log-every "${LOG_EVERY}"
+    --step-checkpoint-every "${STEP_CHECKPOINT_EVERY}"
     --output-dir "${BASE_OUTPUT_DIR}"
     --report-path "${BASE_REPORT}"
   )
 
-  if [[ -n "${BASE_RESUME_CHECKPOINT}" && -f "${BASE_RESUME_CHECKPOINT}" ]]; then
-    base_args+=(--resume-checkpoint "${BASE_RESUME_CHECKPOINT}")
+  if [[ -n "${base_resume_checkpoint}" && -f "${base_resume_checkpoint}" ]]; then
+    base_args+=(--resume-checkpoint "${base_resume_checkpoint}")
   fi
 
   run_stage train_base "${base_args[@]}"
@@ -461,6 +490,14 @@ train_enhancement() {
   if [[ "${FORCE_FINETUNE}" != "1" && -f "${FINAL_CHECKPOINT}" && -f "${FINAL_REPORT}" ]]; then
     stage_log "Final checkpoint/report exist; skipping enhancement fine-tune."
     return
+  fi
+  local enhancement_resume_checkpoint="${TRANSPORT_RESUME_CHECKPOINT}"
+  if [[ -z "${enhancement_resume_checkpoint}" && ! -f "${FINAL_REPORT}" && -f "${FINAL_STEP_CHECKPOINT}" ]]; then
+    enhancement_resume_checkpoint="${FINAL_STEP_CHECKPOINT}"
+    stage_log "Resuming enhancement from step checkpoint: ${enhancement_resume_checkpoint}"
+  fi
+  if [[ -z "${enhancement_resume_checkpoint}" ]]; then
+    enhancement_resume_checkpoint="${BASE_CHECKPOINT}"
   fi
 
   local finetune_args=(
@@ -514,10 +551,11 @@ train_enhancement() {
     --focus-tc 8
     --focus-wt 0.2
     --background-weight 0.001
-    --resume-checkpoint "${BASE_CHECKPOINT}"
+    --resume-checkpoint "${enhancement_resume_checkpoint}"
     --seed "${SEED}"
     --split-seed "${SPLIT_SEED}"
     --log-every "${LOG_EVERY}"
+    --step-checkpoint-every "${STEP_CHECKPOINT_EVERY}"
     --output-dir "${FINAL_OUTPUT_DIR}"
     --report-path "${FINAL_REPORT}"
   )
@@ -541,12 +579,38 @@ train_transport() {
     stage_log "Final checkpoint/report exist; skipping transport training."
     return
   fi
+  local transport_resume_checkpoint="${TRANSPORT_RESUME_CHECKPOINT}"
+  if [[ -z "${transport_resume_checkpoint}" && ! -f "${FINAL_REPORT}" && -f "${FINAL_STEP_CHECKPOINT}" ]]; then
+    transport_resume_checkpoint="${FINAL_STEP_CHECKPOINT}"
+    stage_log "Resuming transport training from step checkpoint: ${transport_resume_checkpoint}"
+  elif [[ -z "${transport_resume_checkpoint}" && ! -f "${FINAL_REPORT}" && -f "${FINAL_CHECKPOINT}" ]]; then
+    transport_resume_checkpoint="${FINAL_CHECKPOINT}"
+    stage_log "Resuming transport training from last checkpoint without final report: ${transport_resume_checkpoint}"
+  fi
+
+  local medical_transport_args=()
+  if [[ "${TARGET_AWARE_MEDICAL_DEFAULTS}" == "1" ]]; then
+    medical_transport_args+=(--target-aware-medical-defaults)
+  fi
+  if [[ "${CLASS_CONDITIONED}" == "1" ]]; then
+    medical_transport_args+=(--class-conditioned)
+  fi
+  if [[ "${MEDICAL_ROLE_CONDITIONING}" == "1" ]]; then
+    medical_transport_args+=(--medical-role-conditioning)
+  fi
+  if [[ "${LEARNED_INITIAL_STATE}" == "1" ]]; then
+    medical_transport_args+=(--learned-initial-state)
+  fi
+  if [[ "${MEDICAL_PROMPT_CONDITIONING}" == "1" ]]; then
+    medical_transport_args+=(--medical-prompt-conditioning)
+  fi
 
   local transport_args=(
     python scripts/train_slice_virtual_modality_drifting.py
     --manifest "${MANIFEST}"
     --device "${DEVICE}"
     --model-kind transport
+    --best-metric "${TRANSPORT_BEST_METRIC}"
     --target-modality "${TARGET_MODALITY}"
     --spatial-size "${SPATIAL_SIZE}"
     --max-subjects "${MAX_SUBJECTS}"
@@ -558,11 +622,20 @@ train_transport() {
     --slice-crop-jitter "${SLICE_CROP_JITTER}"
     --slice-crop-mode region_balanced
     --val-slice-crop-mode "${VAL_SLICE_CROP_MODE}"
+    --slice-sampling-mode "${SLICE_SAMPLING_MODE}"
+    --mixed-background-prob "${MIXED_BACKGROUND_PROB}"
+    --mixed-et-prob "${MIXED_ET_PROB}"
+    --mixed-tc-prob "${MIXED_TC_PROB}"
+    --mixed-wt-prob "${MIXED_WT_PROB}"
     --epochs "${EPOCHS}"
     --max-train-steps "${MAX_TRAIN_STEPS}"
     --batch-size "${BATCH_SIZE}"
     --num-workers "${NUM_WORKERS}"
     --hidden-channels "${HIDDEN_CHANNELS}"
+    "${medical_transport_args[@]}"
+    --role-hidden-channels "${ROLE_HIDDEN_CHANNELS}"
+    --initial-residual-scale "${INITIAL_RESIDUAL_SCALE}"
+    --medical-prompt-channels "${MEDICAL_PROMPT_CHANNELS}"
     --output-activation hardtanh
     --transport-steps "${TRANSPORT_STEPS}"
     --transport-step-scale "${TRANSPORT_STEP_SCALE}"
@@ -586,6 +659,12 @@ train_transport() {
     --enhancement-under-weight 0.30
     --top-intensity-weight 0.35
     --top-intensity-quantile 0.70
+    --prompt-weight "${TRANSPORT_PROMPT_WEIGHT}"
+    --prompt-balanced-bce-weight "${TRANSPORT_PROMPT_BALANCED_BCE_WEIGHT}"
+    --medical-prompt-aux-weight "${MEDICAL_PROMPT_AUX_WEIGHT}"
+    --prompt-et-weight 4
+    --prompt-tc-weight 2
+    --prompt-wt-weight 1
     --focus-dilation 2
     --focus-base 0.1
     --focus-et 24
@@ -595,9 +674,14 @@ train_transport() {
     --seed "${SEED}"
     --split-seed "${SPLIT_SEED}"
     --log-every "${LOG_EVERY}"
+    --step-checkpoint-every "${STEP_CHECKPOINT_EVERY}"
     --output-dir "${FINAL_OUTPUT_DIR}"
     --report-path "${FINAL_REPORT}"
   )
+
+  if [[ -n "${transport_resume_checkpoint}" && -f "${transport_resume_checkpoint}" ]]; then
+    transport_args+=(--resume-checkpoint "${transport_resume_checkpoint}")
+  fi
 
   run_stage train_transport "${transport_args[@]}"
 }
@@ -648,6 +732,33 @@ train_transport_stage2_noharm() {
   if [[ "${FORCE_FINETUNE}" != "1" && -f "${STAGE2_CHECKPOINT}" && -f "${STAGE2_REPORT}" ]]; then
     stage_log "Stage-2 checkpoint/report exist; skipping no-harm fine-tune."
     return
+  fi
+  local stage2_resume_checkpoint="${STAGE2_RESUME_CHECKPOINT}"
+  if [[ -z "${stage2_resume_checkpoint}" && ! -f "${STAGE2_REPORT}" && -f "${STAGE2_STEP_CHECKPOINT}" ]]; then
+    stage2_resume_checkpoint="${STAGE2_STEP_CHECKPOINT}"
+    stage_log "Resuming stage-2 from step checkpoint: ${stage2_resume_checkpoint}"
+  elif [[ -z "${stage2_resume_checkpoint}" && ! -f "${STAGE2_REPORT}" && -f "${STAGE2_CHECKPOINT}" ]]; then
+    stage2_resume_checkpoint="${STAGE2_CHECKPOINT}"
+    stage_log "Resuming stage-2 from last checkpoint without final report: ${stage2_resume_checkpoint}"
+  fi
+  if [[ -z "${stage2_resume_checkpoint}" ]]; then
+    stage2_resume_checkpoint="${source_checkpoint}"
+  fi
+  local medical_transport_args=()
+  if [[ "${TARGET_AWARE_MEDICAL_DEFAULTS}" == "1" ]]; then
+    medical_transport_args+=(--target-aware-medical-defaults)
+  fi
+  if [[ "${CLASS_CONDITIONED}" == "1" ]]; then
+    medical_transport_args+=(--class-conditioned)
+  fi
+  if [[ "${MEDICAL_ROLE_CONDITIONING}" == "1" ]]; then
+    medical_transport_args+=(--medical-role-conditioning)
+  fi
+  if [[ "${LEARNED_INITIAL_STATE}" == "1" ]]; then
+    medical_transport_args+=(--learned-initial-state)
+  fi
+  if [[ "${MEDICAL_PROMPT_CONDITIONING}" == "1" ]]; then
+    medical_transport_args+=(--medical-prompt-conditioning)
   fi
   local stage2_extra_args=()
   if [[ "${STAGE2_GATED_REFINEMENT}" == "1" ]]; then
@@ -705,11 +816,20 @@ train_transport_stage2_noharm() {
       --hard-slice-json "${HARD_SLICE_JSON}" \
       --hard-slice-prob "${HARD_SLICE_PROB}" \
       --hard-slice-top-k "${HARD_SLICE_TOP_K}" \
+      --slice-sampling-mode "${SLICE_SAMPLING_MODE}" \
+      --mixed-background-prob "${MIXED_BACKGROUND_PROB}" \
+      --mixed-et-prob "${MIXED_ET_PROB}" \
+      --mixed-tc-prob "${MIXED_TC_PROB}" \
+      --mixed-wt-prob "${MIXED_WT_PROB}" \
       --epochs "${STAGE2_EPOCHS}" \
       --max-train-steps "${MAX_TRAIN_STEPS}" \
       --batch-size "${BATCH_SIZE}" \
       --num-workers "${NUM_WORKERS}" \
       --hidden-channels "${HIDDEN_CHANNELS}" \
+      "${medical_transport_args[@]}" \
+      --role-hidden-channels "${ROLE_HIDDEN_CHANNELS}" \
+      --initial-residual-scale "${INITIAL_RESIDUAL_SCALE}" \
+      --medical-prompt-channels "${MEDICAL_PROMPT_CHANNELS}" \
       "${stage2_extra_args[@]}" \
       --output-activation hardtanh \
       --transport-steps "${TRANSPORT_STEPS}" \
@@ -748,18 +868,25 @@ train_transport_stage2_noharm() {
       --enhancement-contrast-weight 0.24 \
       --top-intensity-weight 0.55 \
       --top-intensity-quantile 0.72 \
+      --prompt-weight "${TRANSPORT_PROMPT_WEIGHT}" \
+      --prompt-balanced-bce-weight "${TRANSPORT_PROMPT_BALANCED_BCE_WEIGHT}" \
+      --medical-prompt-aux-weight "${MEDICAL_PROMPT_AUX_WEIGHT}" \
+      --prompt-et-weight 4 \
+      --prompt-tc-weight 2 \
+      --prompt-wt-weight 1 \
       --focus-dilation 3 \
       --focus-base 0.08 \
       --focus-et 36 \
       --focus-tc 12 \
       --focus-wt 0.25 \
       --background-weight 0.001 \
-      --resume-checkpoint "${source_checkpoint}" \
       --seed "${SEED}" \
       --split-seed "${SPLIT_SEED}" \
       --log-every "${LOG_EVERY}" \
+      --step-checkpoint-every "${STEP_CHECKPOINT_EVERY}" \
       --output-dir "${STAGE2_OUTPUT_DIR}" \
-      --report-path "${STAGE2_REPORT}"
+      --report-path "${STAGE2_REPORT}" \
+      --resume-checkpoint "${stage2_resume_checkpoint}"
 }
 
 visualize_cases() {

@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 
-export RUN_NAME="${RUN_NAME:-h200_best_t1c_roi_sota}"
+export RUN_NAME="${RUN_NAME:-h200_medical_drift_t1c}"
 
 # Keep large assets outside the git worktree by default.
 export DATA_ROOT="${DATA_ROOT:-/mnt/NeuroState3D_data}"
@@ -83,6 +83,20 @@ export SLICE_CROP_SIZE="${SLICE_CROP_SIZE:-0}"
 export VAL_SLICE_CROP_SIZE="${VAL_SLICE_CROP_SIZE:--1}"
 export VAL_SLICE_CROP_MODE="${VAL_SLICE_CROP_MODE:-}"
 export LOG_EVERY="${LOG_EVERY:-100}"
+export TARGET_AWARE_MEDICAL_DEFAULTS="${TARGET_AWARE_MEDICAL_DEFAULTS:-1}"
+export CLASS_CONDITIONED="${CLASS_CONDITIONED:-1}"
+export MEDICAL_ROLE_CONDITIONING="${MEDICAL_ROLE_CONDITIONING:-1}"
+export LEARNED_INITIAL_STATE="${LEARNED_INITIAL_STATE:-1}"
+export MEDICAL_PROMPT_CONDITIONING="${MEDICAL_PROMPT_CONDITIONING:-1}"
+export ROLE_HIDDEN_CHANNELS="${ROLE_HIDDEN_CHANNELS:-48}"
+export INITIAL_RESIDUAL_SCALE="${INITIAL_RESIDUAL_SCALE:-0.30}"
+export MEDICAL_PROMPT_CHANNELS="${MEDICAL_PROMPT_CHANNELS:-6}"
+export MEDICAL_PROMPT_AUX_WEIGHT="${MEDICAL_PROMPT_AUX_WEIGHT:-0.03}"
+export SLICE_SAMPLING_MODE="${SLICE_SAMPLING_MODE:-medical_mixed}"
+export MIXED_BACKGROUND_PROB="${MIXED_BACKGROUND_PROB:-0.06}"
+export MIXED_ET_PROB="${MIXED_ET_PROB:-0.34}"
+export MIXED_TC_PROB="${MIXED_TC_PROB:-0.25}"
+export MIXED_WT_PROB="${MIXED_WT_PROB:-0.25}"
 
 # Base drift-transport stage.
 export EPOCHS="${EPOCHS:-20}"
@@ -91,8 +105,10 @@ export TRANSPORT_VELOCITY_WEIGHT="${TRANSPORT_VELOCITY_WEIGHT:-0.55}"
 export TRANSPORT_PATH_WEIGHT="${TRANSPORT_PATH_WEIGHT:-0.25}"
 export TRANSPORT_MONOTONIC_WEIGHT="${TRANSPORT_MONOTONIC_WEIGHT:-0.08}"
 
-# Strong ROI/detail stage-2. It uses lesion crops for learning but full slices for selection.
-export TRAIN_STAGE2_HARD="${TRAIN_STAGE2_HARD:-1}"
+# The new main method is one-stage medical drifting. Stage-2 remains available
+# for ablations, but it is no longer the default because earlier H200 runs
+# showed hard-slice fine-tuning overfits after the first epoch.
+export TRAIN_STAGE2_HARD="${TRAIN_STAGE2_HARD:-0}"
 export HARD_SLICE_PROB="${HARD_SLICE_PROB:-0.86}"
 export HARD_SLICE_TOP_K="${HARD_SLICE_TOP_K:-5}"
 export MINE_CANDIDATE_SLICES_PER_SUBJECT="${MINE_CANDIDATE_SLICES_PER_SUBJECT:-10}"
@@ -202,6 +218,7 @@ echo "[H200] Training preset:"
 echo "[H200] BATCH_SIZE=${BATCH_SIZE}, HIDDEN_CHANNELS=${HIDDEN_CHANNELS}, TRANSPORT_STEPS=${TRANSPORT_STEPS}"
 echo "[H200] EPOCHS=${EPOCHS}, STAGE2_EPOCHS=${STAGE2_EPOCHS}, SLICES_PER_SUBJECT=${SLICES_PER_SUBJECT}"
 echo "[H200] SLICE_CONTEXT_RADIUS=${SLICE_CONTEXT_RADIUS}, STAGE2_BEST_METRIC=${STAGE2_BEST_METRIC}"
+echo "[H200] Medical drift: target_aware=${TARGET_AWARE_MEDICAL_DEFAULTS}, role=${MEDICAL_ROLE_CONDITIONING}, learned_init=${LEARNED_INITIAL_STATE}, prompt=${MEDICAL_PROMPT_CONDITIONING}, prompt_channels=${MEDICAL_PROMPT_CHANNELS}, sampling=${SLICE_SAMPLING_MODE}"
 echo "[H200] HF mirror=${USE_HF_MIRROR}, pip index=${PIP_INDEX_URL}"
 
 bash scripts/run_h20_brats_t1c_pipeline.sh

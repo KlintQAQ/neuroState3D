@@ -38,11 +38,150 @@ from utils.brats_metrics import dice_scores, segmentation_loss  # noqa: E402
 from utils.torch_drift_loss import drift_loss  # noqa: E402
 
 BRATS_DATASETS = ("GLI", "MEN", "PED")
+BRATS_REGION_BINS = ("BG", "WT", "TC", "ET")
+BRATS_AREA_BINS = ("none", "small", "medium", "large")
+BRATS_ENHANCEMENT_BINS = ("low", "mid", "high")
+BRATS_Z_BINS = 5
+
+MODALITY_MEDICAL_PROFILES: dict[str, dict[str, Any]] = {
+    "t1n": {
+        "focus": {"base": 0.24, "ET": 1.20, "TC": 1.60, "WT": 0.35},
+        "sampling": {"BG": 0.22, "ET": 0.18, "TC": 0.36, "WT": 0.20},
+        "descriptor_weights": {
+            "energy": 1.05,
+            "global": 1.35,
+            "region_ET": 0.85,
+            "region_TC": 1.15,
+            "region_WT": 0.85,
+            "region_boundary": 1.05,
+            "spatial": 1.10,
+        },
+        "loss_multipliers": {
+            "lesion_texture": 0.75,
+            "edge": 0.90,
+            "enhancement_under": 0.15,
+            "lesion_boundary": 0.85,
+            "enhancement_contrast": 0.10,
+            "top_intensity": 0.20,
+        },
+        "selection": {
+            "mae": 0.40,
+            "ssim": 0.12,
+            "edge_mae": 0.08,
+            "laplacian_mae": 0.06,
+            "mae_ET": 0.06,
+            "mae_TC": 0.12,
+            "mae_WT": 0.06,
+            "high_tumor_mae": 0.04,
+            "high_tumor_under": 0.02,
+        },
+        "salient_region": "TC",
+    },
+    "t1c": {
+        "focus": {"base": 0.08, "ET": 5.00, "TC": 2.20, "WT": 0.40},
+        "sampling": {"BG": 0.06, "ET": 0.40, "TC": 0.28, "WT": 0.20},
+        "descriptor_weights": {
+            "energy": 1.00,
+            "global": 0.90,
+            "region_ET": 1.65,
+            "region_TC": 1.30,
+            "region_WT": 0.95,
+            "region_boundary": 1.45,
+            "spatial": 1.15,
+        },
+        "loss_multipliers": {
+            "lesion_texture": 1.00,
+            "edge": 1.00,
+            "enhancement_under": 1.00,
+            "lesion_boundary": 1.15,
+            "enhancement_contrast": 1.20,
+            "top_intensity": 1.00,
+        },
+        "selection": {
+            "mae": 0.30,
+            "ssim": 0.08,
+            "edge_mae": 0.05,
+            "laplacian_mae": 0.04,
+            "mae_ET": 0.20,
+            "mae_TC": 0.10,
+            "mae_WT": 0.04,
+            "high_tumor_mae": 0.16,
+            "high_tumor_under": 0.14,
+        },
+        "salient_region": "ET",
+    },
+    "t2w": {
+        "focus": {"base": 0.10, "ET": 0.80, "TC": 1.45, "WT": 3.30},
+        "sampling": {"BG": 0.08, "ET": 0.14, "TC": 0.24, "WT": 0.50},
+        "descriptor_weights": {
+            "energy": 1.05,
+            "global": 1.00,
+            "region_ET": 0.90,
+            "region_TC": 1.15,
+            "region_WT": 1.55,
+            "region_boundary": 1.25,
+            "spatial": 1.20,
+        },
+        "loss_multipliers": {
+            "lesion_texture": 1.15,
+            "edge": 1.05,
+            "enhancement_under": 0.45,
+            "lesion_boundary": 1.20,
+            "enhancement_contrast": 0.35,
+            "top_intensity": 0.55,
+        },
+        "selection": {
+            "mae": 0.32,
+            "ssim": 0.10,
+            "edge_mae": 0.06,
+            "laplacian_mae": 0.06,
+            "mae_ET": 0.04,
+            "mae_TC": 0.10,
+            "mae_WT": 0.22,
+            "high_tumor_mae": 0.06,
+            "high_tumor_under": 0.04,
+        },
+        "salient_region": "WT",
+    },
+    "t2f": {
+        "focus": {"base": 0.08, "ET": 0.70, "TC": 1.35, "WT": 3.80},
+        "sampling": {"BG": 0.06, "ET": 0.12, "TC": 0.22, "WT": 0.56},
+        "descriptor_weights": {
+            "energy": 1.05,
+            "global": 0.95,
+            "region_ET": 0.85,
+            "region_TC": 1.15,
+            "region_WT": 1.70,
+            "region_boundary": 1.35,
+            "spatial": 1.25,
+        },
+        "loss_multipliers": {
+            "lesion_texture": 1.20,
+            "edge": 1.10,
+            "enhancement_under": 0.45,
+            "lesion_boundary": 1.25,
+            "enhancement_contrast": 0.30,
+            "top_intensity": 0.60,
+        },
+        "selection": {
+            "mae": 0.30,
+            "ssim": 0.10,
+            "edge_mae": 0.07,
+            "laplacian_mae": 0.06,
+            "mae_ET": 0.04,
+            "mae_TC": 0.10,
+            "mae_WT": 0.25,
+            "high_tumor_mae": 0.05,
+            "high_tumor_under": 0.03,
+        },
+        "salient_region": "WT",
+    },
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a 2D slice-wise drifting generator for missing BraTS T1c."
+        description="Train a 2D slice-wise drifting generator for missing BraTS MRI modalities."
     )
     parser.add_argument(
         "--manifest",
@@ -78,6 +217,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hard-slice-prob", type=float, default=0.0)
     parser.add_argument("--hard-slice-min-score", type=float, default=0.0)
     parser.add_argument("--hard-slice-top-k", type=int, default=0)
+    parser.add_argument(
+        "--target-aware-medical-defaults",
+        action="store_true",
+        help="Use target-specific BraTS MRI priors for sampling, focus, drift, prompts, and checkpoint selection.",
+    )
+    parser.add_argument(
+        "--slice-sampling-mode",
+        default="tumor",
+        choices=("tumor", "medical_mixed"),
+    )
+    parser.add_argument("--mixed-background-prob", type=float, default=0.05)
+    parser.add_argument("--mixed-et-prob", type=float, default=0.30)
+    parser.add_argument("--mixed-tc-prob", type=float, default=0.25)
+    parser.add_argument("--mixed-wt-prob", type=float, default=0.25)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-train-steps", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -96,6 +249,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transport-step-scale", type=float, default=1.0)
     parser.add_argument("--transport-velocity-scale", type=float, default=1.0)
     parser.add_argument("--transport-init-blur-kernel", type=int, default=5)
+    parser.add_argument("--medical-role-conditioning", action="store_true")
+    parser.add_argument("--learned-initial-state", action="store_true")
+    parser.add_argument("--medical-prompt-conditioning", action="store_true")
+    parser.add_argument("--role-hidden-channels", type=int, default=0)
+    parser.add_argument("--initial-residual-scale", type=float, default=0.35)
+    parser.add_argument("--medical-prompt-channels", type=int, default=5)
     parser.add_argument("--transport-velocity-weight", type=float, default=0.0)
     parser.add_argument("--transport-path-weight", type=float, default=0.0)
     parser.add_argument("--transport-monotonic-weight", type=float, default=0.0)
@@ -181,6 +340,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-intensity-quantile", type=float, default=0.80)
     parser.add_argument("--prompt-weight", type=float, default=0.0)
     parser.add_argument("--prompt-balanced-bce-weight", type=float, default=0.0)
+    parser.add_argument("--medical-prompt-aux-weight", type=float, default=0.0)
     parser.add_argument("--prompt-max-pos-weight", type=float, default=50.0)
     parser.add_argument("--prompt-et-weight", type=float, default=3.0)
     parser.add_argument("--prompt-tc-weight", type=float, default=2.0)
@@ -196,6 +356,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=46)
     parser.add_argument("--split-seed", type=int, default=-1)
     parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument("--step-checkpoint-every", type=int, default=0)
+    parser.add_argument(
+        "--step-checkpoint-name",
+        default="slice_virtual_modality_generator_step.pt",
+    )
     parser.add_argument(
         "--output-dir",
         default=str(ROOT / "outputs" / "slice_virtual_modality_drifting"),
@@ -213,6 +378,82 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def modality_profile(target_modality: str) -> dict[str, Any]:
+    return MODALITY_MEDICAL_PROFILES.get(target_modality, MODALITY_MEDICAL_PROFILES["t1c"])
+
+
+def modality_focus_weights(
+    args: argparse.Namespace,
+) -> tuple[float, float, float, float]:
+    if not bool(getattr(args, "target_aware_medical_defaults", False)):
+        return (
+            float(args.focus_base),
+            float(args.focus_et),
+            float(args.focus_tc),
+            float(args.focus_wt),
+        )
+    focus = modality_profile(args.target_modality)["focus"]
+    return (
+        float(focus["base"]),
+        float(focus["ET"]),
+        float(focus["TC"]),
+        float(focus["WT"]),
+    )
+
+
+def modality_sampling_probs(
+    target_modality: str,
+    target_aware: bool,
+    background: float,
+    et: float,
+    tc: float,
+    wt: float,
+) -> dict[str, float]:
+    if not target_aware:
+        return {
+            "BG": float(background),
+            "ET": float(et),
+            "TC": float(tc),
+            "WT": float(wt),
+        }
+    return {
+        key: float(value)
+        for key, value in modality_profile(target_modality)["sampling"].items()
+    }
+
+
+def modality_descriptor_weight(target_modality: str, feature_name: str) -> float:
+    weights = modality_profile(target_modality)["descriptor_weights"]
+    if feature_name.startswith("spatial"):
+        return float(weights.get("spatial", 1.0))
+    return float(weights.get(feature_name, 1.0))
+
+
+def modality_loss_weight(args: argparse.Namespace, arg_name: str, loss_name: str) -> float:
+    base = float(getattr(args, arg_name))
+    if not bool(getattr(args, "target_aware_medical_defaults", False)):
+        return base
+    multipliers = modality_profile(args.target_modality).get("loss_multipliers", {})
+    return base * float(multipliers.get(loss_name, 1.0))
+
+
+def modality_prompt_channel_weights(target_modality: str, channels: int) -> list[float]:
+    salient = str(modality_profile(target_modality)["salient_region"])
+    region_weights = {"ET": 2.0, "TC": 1.6, "WT": 1.4}
+    region_weights[salient] = 3.0
+    weights = [
+        region_weights["ET"],
+        region_weights["TC"],
+        region_weights["WT"],
+        1.4,
+        0.35,
+        2.0,
+    ]
+    if channels <= len(weights):
+        return weights[:channels]
+    return weights + [1.0] * (channels - len(weights))
 
 
 def read_rows(path: str | Path) -> list[dict[str, str]]:
@@ -308,6 +549,12 @@ class BraTSSliceDataset(Dataset):
         slice_crop_mode: str = "none",
         hard_slices: dict[str, list[tuple[int, float]]] | None = None,
         hard_slice_prob: float = 0.0,
+        target_aware_sampling: bool = False,
+        slice_sampling_mode: str = "tumor",
+        mixed_background_prob: float = 0.05,
+        mixed_et_prob: float = 0.30,
+        mixed_tc_prob: float = 0.25,
+        mixed_wt_prob: float = 0.25,
     ) -> None:
         rows = read_rows(manifest_csv)
         if max_subjects is not None:
@@ -327,6 +574,13 @@ class BraTSSliceDataset(Dataset):
         self.slice_crop_mode = slice_crop_mode
         self.hard_slices = hard_slices or {}
         self.hard_slice_prob = float(max(0.0, min(1.0, hard_slice_prob)))
+        self.target_modality = target_modality
+        self.target_aware_sampling = bool(target_aware_sampling)
+        self.slice_sampling_mode = slice_sampling_mode
+        self.mixed_background_prob = float(max(0.0, mixed_background_prob))
+        self.mixed_et_prob = float(max(0.0, mixed_et_prob))
+        self.mixed_tc_prob = float(max(0.0, mixed_tc_prob))
+        self.mixed_wt_prob = float(max(0.0, mixed_wt_prob))
 
     def __len__(self) -> int:
         return len(self.rows) * self.slices_per_subject
@@ -366,14 +620,35 @@ class BraTSSliceDataset(Dataset):
         mask = torch.ones(len(BRATS_MODALITIES) * self.context_depth, dtype=torch.float32)
         start = self.base_target_index * self.context_depth
         mask[start : start + self.context_depth] = 0.0
+        medical_bins = self._medical_condition_bins(
+            image_slice[self.target_index],
+            target,
+            z,
+            seg.shape[-1],
+        )
         return {
             "image": image_slice,
             "target_regions": target,
             "observed_mask": mask,
             "target_index": self.target_index,
             "dataset": row["dataset"],
+            "dataset_id": torch.tensor(
+                BRATS_DATASETS.index(row["dataset"].upper())
+                if row["dataset"].upper() in BRATS_DATASETS
+                else -1,
+                dtype=torch.long,
+            ),
             "subject_id": row["subject_id"],
             "slice_index": z,
+            "z_bin": torch.tensor(medical_bins["z_bin"], dtype=torch.long),
+            "region_bin": torch.tensor(medical_bins["region_bin"], dtype=torch.long),
+            "lesion_area_bin": torch.tensor(medical_bins["lesion_area_bin"], dtype=torch.long),
+            "enhancement_bin": torch.tensor(medical_bins["enhancement_bin"], dtype=torch.long),
+            "lesion_fraction": torch.tensor(medical_bins["lesion_fraction"], dtype=torch.float32),
+            "target_region_mean": torch.tensor(
+                medical_bins["target_region_mean"],
+                dtype=torch.float32,
+            ),
         }
 
     def _sample_slice(self, seg: np.ndarray, rng: random.Random, subject_id: str) -> int:
@@ -391,12 +666,61 @@ class BraTSSliceDataset(Dataset):
                     if running >= cursor:
                         return int(z)
                 return int(valid[-1][0])
+        if self.slice_sampling_mode == "medical_mixed":
+            sampled = self._sample_medical_mixed_slice(seg, rng)
+            if sampled is not None:
+                return sampled
         # Prefer slices containing enhancing tumor or tumor core; fall back to any foreground.
         candidates = np.where(((seg == 3) | (seg == 1)).sum(axis=(0, 1)) > 0)[0]
         if candidates.size == 0:
             candidates = np.where((seg > 0).sum(axis=(0, 1)) > 0)[0]
         if candidates.size == 0:
             return rng.randrange(seg.shape[-1])
+        return int(candidates[rng.randrange(candidates.size)])
+
+    def _sample_medical_mixed_slice(self, seg: np.ndarray, rng: random.Random) -> int | None:
+        depth = int(seg.shape[-1])
+        probs = modality_sampling_probs(
+            self.target_modality,
+            self.target_aware_sampling,
+            self.mixed_background_prob,
+            self.mixed_et_prob,
+            self.mixed_tc_prob,
+            self.mixed_wt_prob,
+        )
+        choices = [
+            ("ET", probs["ET"]),
+            ("TC", probs["TC"]),
+            ("WT", probs["WT"]),
+            ("BG", probs["BG"]),
+        ]
+        total = sum(weight for _, weight in choices)
+        if total <= 0.0:
+            return None
+        cursor = rng.random() * total
+        running = 0.0
+        selected = choices[-1][0]
+        for name, weight in choices:
+            running += weight
+            if cursor <= running:
+                selected = name
+                break
+        if selected == "ET":
+            candidates = np.where((seg == 3).sum(axis=(0, 1)) > 0)[0]
+        elif selected == "TC":
+            candidates = np.where(((seg == 1) | (seg == 3)).sum(axis=(0, 1)) > 0)[0]
+        elif selected == "WT":
+            candidates = np.where((seg > 0).sum(axis=(0, 1)) > 0)[0]
+        else:
+            tumor_by_slice = (seg > 0).sum(axis=(0, 1))
+            support = np.where(tumor_by_slice == 0)[0]
+            if support.size == 0:
+                support = np.arange(depth)
+            candidates = support
+        if candidates.size == 0:
+            candidates = np.where((seg > 0).sum(axis=(0, 1)) > 0)[0]
+        if candidates.size == 0:
+            return rng.randrange(depth)
         return int(candidates[rng.randrange(candidates.size)])
 
     def _context_slices(self, image: np.ndarray, z: int) -> torch.Tensor:
@@ -442,6 +766,62 @@ class BraTSSliceDataset(Dataset):
             image_slice[:, top : top + crop, left : left + crop],
             target_regions[:, top : top + crop, left : left + crop],
         )
+
+    @staticmethod
+    def _medical_condition_bins(
+        target_slice: torch.Tensor,
+        target_regions: torch.Tensor,
+        z: int,
+        depth: int,
+    ) -> dict[str, float | int]:
+        et = target_regions[0] > 0.5
+        tc = target_regions[1] > 0.5
+        wt = target_regions[2] > 0.5
+        lesion_fraction = float(wt.float().mean().item())
+        if et.any():
+            region_bin = BRATS_REGION_BINS.index("ET")
+            region_mask = et
+        elif tc.any():
+            region_bin = BRATS_REGION_BINS.index("TC")
+            region_mask = tc
+        elif wt.any():
+            region_bin = BRATS_REGION_BINS.index("WT")
+            region_mask = wt
+        else:
+            region_bin = BRATS_REGION_BINS.index("BG")
+            region_mask = torch.ones_like(wt, dtype=torch.bool)
+
+        if lesion_fraction <= 0.0:
+            area_bin = BRATS_AREA_BINS.index("none")
+        elif lesion_fraction < 0.01:
+            area_bin = BRATS_AREA_BINS.index("small")
+        elif lesion_fraction < 0.05:
+            area_bin = BRATS_AREA_BINS.index("medium")
+        else:
+            area_bin = BRATS_AREA_BINS.index("large")
+
+        region_values = target_slice[region_mask]
+        if region_values.numel() == 0:
+            target_region_mean = 0.0
+        else:
+            target_region_mean = float(region_values.float().mean().item())
+        if target_region_mean >= 0.36:
+            enhancement_bin = BRATS_ENHANCEMENT_BINS.index("high")
+        elif target_region_mean >= 0.12:
+            enhancement_bin = BRATS_ENHANCEMENT_BINS.index("mid")
+        else:
+            enhancement_bin = BRATS_ENHANCEMENT_BINS.index("low")
+
+        z_norm = 0.0 if depth <= 1 else float(z) / float(depth - 1)
+        z_bin = int(max(0, min(BRATS_Z_BINS - 1, math.floor(z_norm * BRATS_Z_BINS))))
+        return {
+            "z_bin": z_bin,
+            "region_bin": region_bin,
+            "lesion_area_bin": area_bin,
+            "enhancement_bin": enhancement_bin,
+            "lesion_fraction": lesion_fraction,
+            "target_region_mean": target_region_mean,
+        }
 
 
 def subject_level_split_indices(
@@ -1257,7 +1637,12 @@ def prompt_balanced_bce_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
     max_pos_weight: float,
+    channel_weights: Sequence[float] | None = None,
 ) -> torch.Tensor:
+    if logits.shape[1] != target.shape[1]:
+        raise ValueError(
+            f"Prompt logits/target channel mismatch: {logits.shape[1]} vs {target.shape[1]}"
+        )
     dims = tuple(range(2, target.ndim))
     positives = target.sum(dim=dims)
     total = float(np.prod(target.shape[2:]))
@@ -1270,12 +1655,47 @@ def prompt_balanced_bce_loss(
         pos_weight=pos_weight.mean(dim=0).view(view_shape),
         reduction="none",
     )
+    if channel_weights is None:
+        weights = [4.0, 2.5, 1.0] + [1.0] * max(0, target.shape[1] - 3)
+    else:
+        weights = [float(weight) for weight in channel_weights]
+        if len(weights) < target.shape[1]:
+            weights.extend([1.0] * (target.shape[1] - len(weights)))
     region_weights = torch.tensor(
-        [4.0, 2.5, 1.0],
+        weights[: target.shape[1]],
         dtype=loss.dtype,
         device=loss.device,
     ).view(view_shape)
     return (loss * region_weights).mean()
+
+
+def medical_prompt_targets(
+    target_regions: torch.Tensor,
+    support: torch.Tensor,
+    channels: int,
+    target_modality: str,
+    dilation: int = 0,
+) -> torch.Tensor:
+    channels = int(max(0, channels))
+    if channels <= 0:
+        return target_regions[:, :0]
+    regions = target_regions.float()
+    if dilation > 0:
+        kernel = int(dilation) * 2 + 1
+        regions = F.max_pool2d(regions, kernel_size=kernel, stride=1, padding=int(dilation))
+    et = regions[:, 0:1].clamp(0.0, 1.0)
+    tc = regions[:, 1:2].clamp(0.0, 1.0)
+    wt = regions[:, 2:3].clamp(0.0, 1.0)
+    boundary = edge_magnitude_2d(wt).clamp(0.0, 1.0)
+    boundary = F.max_pool2d(boundary, kernel_size=3, stride=1, padding=1)
+    brain = support.to(device=regions.device, dtype=regions.dtype).clamp(0.0, 1.0)
+    salient_name = str(modality_profile(target_modality)["salient_region"])
+    salient = {"ET": et, "TC": tc, "WT": wt}.get(salient_name, wt)
+    pieces = [et, tc, wt, boundary, brain, salient]
+    if channels <= len(pieces):
+        return torch.cat(pieces[:channels], dim=1)
+    padding = [torch.zeros_like(et) for _ in range(channels - len(pieces))]
+    return torch.cat([*pieces, *padding], dim=1)
 
 
 def patch_tokens_2d(slice_tensor: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -1577,6 +1997,7 @@ def medical_multilevel_descriptors_2d(
     image: torch.Tensor,
     focus: torch.Tensor,
     window_sizes: Sequence[int],
+    target_regions: torch.Tensor | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     features = conv_medical_features_2d(image)
     descriptors: dict[str, torch.Tensor] = {}
@@ -1588,6 +2009,26 @@ def medical_multilevel_descriptors_2d(
 
     descriptors["global"] = weighted_global_stats_tokens_2d(features, focus)
     weights["global"] = image.new_ones((image.shape[0], 1))
+
+    if target_regions is not None:
+        regions = target_regions.to(device=image.device, dtype=image.dtype)
+        if regions.shape[-2:] != image.shape[-2:]:
+            regions = F.interpolate(regions, size=image.shape[-2:], mode="nearest")
+        for channel, region_name in enumerate(BRATS_REGIONS):
+            mask = regions[:, channel : channel + 1].clamp(0.0, 1.0)
+            descriptors[f"region_{region_name}"] = weighted_global_stats_tokens_2d(
+                features,
+                mask.clamp_min(1e-4),
+            )
+            weights[f"region_{region_name}"] = image.new_ones((image.shape[0], 1))
+        wt = regions[:, 2:3].clamp(0.0, 1.0)
+        boundary = edge_magnitude_2d(wt).clamp(0.0, 1.0)
+        boundary = F.max_pool2d(boundary, kernel_size=3, stride=1, padding=1)
+        descriptors["region_boundary"] = weighted_global_stats_tokens_2d(
+            features,
+            boundary.clamp_min(1e-4),
+        )
+        weights["region_boundary"] = image.new_ones((image.shape[0], 1))
 
     for raw_size in window_sizes:
         size = max(1, int(raw_size))
@@ -1665,6 +2106,10 @@ class _TokenStore:
             combined = combined[-self.max_tokens :]
         self._storage[key] = combined
 
+    def add_many(self, keys: Sequence[str], tokens: torch.Tensor) -> None:
+        for key in keys:
+            self.add(key, tokens)
+
     def sample(
         self,
         key: str,
@@ -1680,9 +2125,57 @@ class _TokenStore:
         indices = torch.randint(0, tokens.shape[0], (batch_size, count))
         return tokens[indices].to(device=device, dtype=dtype)
 
+    def sample_many(
+        self,
+        key_options: Sequence[Sequence[str]],
+        count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        count = int(max(0, count))
+        if count <= 0:
+            return None
+        rows = []
+        any_found = False
+        for options in key_options:
+            sampled = None
+            for key in options:
+                tokens = self._storage.get(key)
+                if tokens is None or tokens.numel() == 0:
+                    continue
+                indices = torch.randint(0, tokens.shape[0], (count,))
+                sampled = tokens[indices]
+                break
+            if sampled is None:
+                sampled = self._sample_any(count)
+            if sampled is None:
+                rows.append(None)
+            else:
+                rows.append(sampled)
+                any_found = True
+        if not any_found:
+            return None
+        first = next(row for row in rows if row is not None)
+        filled = [first.new_zeros(first.shape) if row is None else row for row in rows]
+        return torch.stack(filled, dim=0).to(device=device, dtype=dtype)
+
     def count(self, key: str) -> int:
         tokens = self._storage.get(key)
         return 0 if tokens is None else int(tokens.shape[0])
+
+    def total_count(self) -> int:
+        return sum(int(tokens.shape[0]) for tokens in self._storage.values())
+
+    def key_count(self) -> int:
+        return len(self._storage)
+
+    def _sample_any(self, count: int) -> torch.Tensor | None:
+        nonempty = [tokens for tokens in self._storage.values() if tokens.numel() > 0]
+        if not nonempty:
+            return None
+        tokens = nonempty[int(torch.randint(0, len(nonempty), ()).item())]
+        indices = torch.randint(0, tokens.shape[0], (count,))
+        return tokens[indices]
 
 
 class MedicalDriftBank2D:
@@ -1700,6 +2193,101 @@ class MedicalDriftBank2D:
     def _key(target_modality: str, feature_name: str) -> str:
         return f"{target_modality}:{feature_name}"
 
+    @staticmethod
+    def _condition_value(
+        batch: dict[str, Any] | None,
+        key: str,
+        index: int,
+        default: int,
+    ) -> int:
+        if batch is None or key not in batch:
+            return int(default)
+        value = batch[key]
+        if torch.is_tensor(value):
+            flat = value.detach().cpu().flatten()
+            if flat.numel() <= index:
+                return int(default)
+            return int(flat[index].item())
+        if isinstance(value, (list, tuple)):
+            try:
+                return int(value[index])
+            except (TypeError, ValueError, IndexError):
+                return int(default)
+        return int(default)
+
+    @staticmethod
+    def _dataset_name(batch: dict[str, Any] | None, index: int) -> str:
+        if batch is None:
+            return "ALL"
+        datasets = batch.get("dataset")
+        if isinstance(datasets, (list, tuple)) and index < len(datasets):
+            name = str(datasets[index]).upper()
+            return name if name in BRATS_DATASETS else "ALL"
+        dataset_id = MedicalDriftBank2D._condition_value(batch, "dataset_id", index, -1)
+        if 0 <= dataset_id < len(BRATS_DATASETS):
+            return BRATS_DATASETS[dataset_id]
+        return "ALL"
+
+    @staticmethod
+    def _name_from_index(names: Sequence[str], value: int, default: str) -> str:
+        return names[int(value)] if 0 <= int(value) < len(names) else default
+
+    def _condition_keys(
+        self,
+        target_modality: str,
+        feature_name: str,
+        batch: dict[str, Any] | None,
+        index: int,
+    ) -> list[str]:
+        prefix = self._key(target_modality, feature_name)
+        if batch is None:
+            return [f"{prefix}:global", prefix]
+        dataset = self._dataset_name(batch, index)
+        region = self._name_from_index(
+            BRATS_REGION_BINS,
+            self._condition_value(batch, "region_bin", index, 0),
+            "BG",
+        )
+        area = self._name_from_index(
+            BRATS_AREA_BINS,
+            self._condition_value(batch, "lesion_area_bin", index, 0),
+            "none",
+        )
+        enhancement = self._name_from_index(
+            BRATS_ENHANCEMENT_BINS,
+            self._condition_value(batch, "enhancement_bin", index, 0),
+            "low",
+        )
+        z_bin = max(
+            0,
+            min(
+                BRATS_Z_BINS - 1,
+                self._condition_value(batch, "z_bin", index, BRATS_Z_BINS // 2),
+            ),
+        )
+        return [
+            f"{prefix}:ds={dataset}:r={region}:z={z_bin}:e={enhancement}:a={area}",
+            f"{prefix}:ds={dataset}:r={region}:z={z_bin}:e={enhancement}",
+            f"{prefix}:ds={dataset}:r={region}:e={enhancement}",
+            f"{prefix}:ds={dataset}:r={region}",
+            f"{prefix}:r={region}:e={enhancement}",
+            f"{prefix}:ds={dataset}",
+            f"{prefix}:global",
+            prefix,
+        ]
+
+    def _batch_key_options(
+        self,
+        target_modality: str,
+        feature_name: str,
+        batch_size: int,
+        batch: dict[str, Any] | None,
+    ) -> list[list[str]]:
+        return [
+            self._condition_keys(target_modality, feature_name, batch, index)
+            for index in range(batch_size)
+        ]
+
     def sample_positive(
         self,
         target_modality: str,
@@ -1707,7 +2295,15 @@ class MedicalDriftBank2D:
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
+        batch: dict[str, Any] | None = None,
     ) -> torch.Tensor | None:
+        if batch is not None:
+            return self.positive.sample_many(
+                self._batch_key_options(target_modality, feature_name, batch_size, batch),
+                self.memory_tokens,
+                device,
+                dtype,
+            )
         return self.positive.sample(
             self._key(target_modality, feature_name),
             batch_size,
@@ -1723,7 +2319,15 @@ class MedicalDriftBank2D:
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
+        batch: dict[str, Any] | None = None,
     ) -> torch.Tensor | None:
+        if batch is not None:
+            return self.negative.sample_many(
+                self._batch_key_options(target_modality, feature_name, batch_size, batch),
+                self.memory_tokens,
+                device,
+                dtype,
+            )
         return self.negative.sample(
             self._key(target_modality, feature_name),
             batch_size,
@@ -1737,11 +2341,32 @@ class MedicalDriftBank2D:
         target_modality: str,
         positive_descriptors: dict[str, torch.Tensor],
         negative_descriptors: dict[str, torch.Tensor],
+        batch: dict[str, Any] | None = None,
     ) -> None:
         for name, tokens in positive_descriptors.items():
-            self.positive.add(self._key(target_modality, name), tokens)
+            if batch is None:
+                self.positive.add_many(
+                    [f"{self._key(target_modality, name)}:global", self._key(target_modality, name)],
+                    tokens,
+                )
+            else:
+                for index in range(tokens.shape[0]):
+                    self.positive.add_many(
+                        self._condition_keys(target_modality, name, batch, index),
+                        tokens[index : index + 1],
+                    )
         for name, tokens in negative_descriptors.items():
-            self.negative.add(self._key(target_modality, name), tokens)
+            if batch is None:
+                self.negative.add_many(
+                    [f"{self._key(target_modality, name)}:global", self._key(target_modality, name)],
+                    tokens,
+                )
+            else:
+                for index in range(tokens.shape[0]):
+                    self.negative.add_many(
+                        self._condition_keys(target_modality, name, batch, index),
+                        tokens[index : index + 1],
+                    )
 
     def counts(self, target_modality: str, feature_names: Sequence[str]) -> dict[str, int]:
         return {
@@ -1750,6 +2375,11 @@ class MedicalDriftBank2D:
         } | {
             f"bank_neg_{name}": self.negative.count(self._key(target_modality, name))
             for name in feature_names
+        } | {
+            "bank_pos_total_tokens": self.positive.total_count(),
+            "bank_neg_total_tokens": self.negative.total_count(),
+            "bank_pos_key_count": self.positive.key_count(),
+            "bank_neg_key_count": self.negative.key_count(),
         }
 
 
@@ -1757,22 +2387,26 @@ def medical_multilevel_drift_loss(
     synthetic: torch.Tensor,
     target: torch.Tensor,
     focus: torch.Tensor,
+    target_regions: torch.Tensor | None,
     target_modality: str,
     bank: MedicalDriftBank2D,
     window_sizes: Sequence[int],
     radii: Sequence[float],
     token_clamp: float,
     max_current_tokens: int,
+    batch: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     generated_desc, generated_weights = medical_multilevel_descriptors_2d(
         synthetic,
         focus,
         window_sizes,
+        target_regions,
     )
     positive_desc, positive_weights = medical_multilevel_descriptors_2d(
         target,
         focus,
         window_sizes,
+        target_regions,
     )
     losses = []
     report: dict[str, float] = {}
@@ -1791,6 +2425,7 @@ def medical_multilevel_drift_loss(
             batch_size,
             generated_tokens.device,
             generated_tokens.dtype,
+            batch,
         )
         negative_memory = bank.sample_negative(
             target_modality,
@@ -1798,6 +2433,7 @@ def medical_multilevel_drift_loss(
             batch_size,
             generated_tokens.device,
             generated_tokens.dtype,
+            batch,
         )
 
         positive_all = (
@@ -1844,10 +2480,13 @@ def medical_multilevel_drift_loss(
             ),
             radii=radii,
         )
-        losses.append(loss)
+        descriptor_weight = modality_descriptor_weight(target_modality, name)
+        weighted_loss = float(descriptor_weight) * loss
+        losses.append(weighted_loss)
         report[f"medical_drift_{name}"] = float(loss.detach().cpu().item())
+        report[f"medical_drift_{name}_weight"] = float(descriptor_weight)
 
-    bank.update(target_modality, positive_desc, generated_desc)
+    bank.update(target_modality, positive_desc, generated_desc, batch)
     report.update(bank.counts(target_modality, feature_names))
     if not losses:
         return synthetic.new_zeros(()), report
@@ -1868,12 +2507,13 @@ def loss_for_batch(
     generated = generator_forward(model, image, batch["observed_mask"], batch)
     synthetic = generated["synthetic"]
     uncertainty = generated["uncertainty"]
+    focus_base, focus_et, focus_tc, focus_wt = modality_focus_weights(args)
     focus = region_focus(
         batch["target_regions"],
-        args.focus_base,
-        args.focus_et,
-        args.focus_tc,
-        args.focus_wt,
+        focus_base,
+        focus_et,
+        focus_tc,
+        focus_wt,
         args.focus_dilation,
     )
     support = observed_brain_support(
@@ -1996,12 +2636,14 @@ def loss_for_batch(
             synthetic,
             target,
             focus,
+            batch["target_regions"],
             args.target_modality,
             medical_bank,
             args.medical_drift_window_sizes,
             args.medical_drift_radii,
             args.medical_drift_token_clamp,
             args.medical_drift_max_current_tokens,
+            batch,
         )
     transport_velocity = (
         transport_velocity_loss(
@@ -2023,9 +2665,27 @@ def loss_for_batch(
         if float(args.transport_monotonic_weight) > 0.0
         else synthetic.new_zeros(())
     )
+    lesion_texture_weight = modality_loss_weight(args, "lesion_texture_weight", "lesion_texture")
+    edge_weight = modality_loss_weight(args, "edge_weight", "edge")
+    enhancement_under_weight = modality_loss_weight(
+        args,
+        "enhancement_under_weight",
+        "enhancement_under",
+    )
+    lesion_boundary_weight = modality_loss_weight(
+        args,
+        "lesion_boundary_weight",
+        "lesion_boundary",
+    )
+    enhancement_contrast_weight = modality_loss_weight(
+        args,
+        "enhancement_contrast_weight",
+        "enhancement_contrast",
+    )
+    top_intensity_weight = modality_loss_weight(args, "top_intensity_weight", "top_intensity")
     lesion_texture = (
         lesion_texture_loss(synthetic, target, batch["target_regions"], args.focus_dilation)
-        if float(args.lesion_texture_weight) > 0.0
+        if lesion_texture_weight > 0.0
         else synthetic.new_zeros(())
     )
     region_moment = (
@@ -2035,22 +2695,22 @@ def loss_for_batch(
     )
     edge = (
         tumor_edge_loss(synthetic, target, batch["target_regions"], args.focus_dilation)
-        if float(args.edge_weight) > 0.0
+        if edge_weight > 0.0
         else synthetic.new_zeros(())
     )
     enhance_under = (
         enhancement_under_loss(synthetic, target, batch["target_regions"])
-        if float(args.enhancement_under_weight) > 0.0
+        if enhancement_under_weight > 0.0
         else synthetic.new_zeros(())
     )
     lesion_boundary = (
         lesion_boundary_band_loss(synthetic, target, batch["target_regions"], args.focus_dilation)
-        if float(args.lesion_boundary_weight) > 0.0
+        if lesion_boundary_weight > 0.0
         else synthetic.new_zeros(())
     )
     enhancement_contrast = (
         enhancement_contrast_loss(synthetic, target, batch["target_regions"], args.focus_dilation)
-        if float(args.enhancement_contrast_weight) > 0.0
+        if enhancement_contrast_weight > 0.0
         else synthetic.new_zeros(())
     )
     gate_supervision = (
@@ -2213,7 +2873,7 @@ def loss_for_batch(
             batch["target_regions"],
             args.top_intensity_quantile,
         )
-        if float(args.top_intensity_weight) > 0.0
+        if top_intensity_weight > 0.0
         else synthetic.new_zeros(())
     )
     prompt = (
@@ -2234,6 +2894,22 @@ def loss_for_batch(
         if "prompt_logits" in generated and float(args.prompt_balanced_bce_weight) > 0.0
         else synthetic.new_zeros(())
     )
+    medical_prompt_aux = synthetic.new_zeros(())
+    if "medical_prompt_logits" in generated and float(args.medical_prompt_aux_weight) > 0.0:
+        medical_logits = generated["medical_prompt_logits"]
+        medical_targets = medical_prompt_targets(
+            batch["target_regions"],
+            support,
+            medical_logits.shape[1],
+            args.target_modality,
+            args.focus_dilation,
+        )
+        medical_prompt_aux = prompt_balanced_bce_loss(
+            medical_logits,
+            medical_targets.detach(),
+            args.prompt_max_pos_weight,
+            modality_prompt_channel_weights(args.target_modality, medical_logits.shape[1]),
+        )
     loss = (
         float(args.recon_weight) * recon
         + float(args.nll_weight) * nll
@@ -2251,12 +2927,12 @@ def loss_for_batch(
         + float(args.transport_velocity_weight) * transport_velocity
         + float(args.transport_path_weight) * transport_path
         + float(args.transport_monotonic_weight) * transport_monotonic
-        + float(args.lesion_texture_weight) * lesion_texture
+        + lesion_texture_weight * lesion_texture
         + float(args.region_moment_weight) * region_moment
-        + float(args.edge_weight) * edge
-        + float(args.enhancement_under_weight) * enhance_under
-        + float(args.lesion_boundary_weight) * lesion_boundary
-        + float(args.enhancement_contrast_weight) * enhancement_contrast
+        + edge_weight * edge
+        + enhancement_under_weight * enhance_under
+        + lesion_boundary_weight * lesion_boundary
+        + enhancement_contrast_weight * enhancement_contrast
         + float(args.gate_supervision_weight) * gate_supervision
         + float(args.residual_need_gate_weight) * residual_need_gate
         + float(args.gate_sparsity_weight) * gate_sparsity
@@ -2273,9 +2949,10 @@ def loss_for_batch(
         + float(args.lesion_residual_target_weight) * lesion_residual_target
         + float(args.enhancement_residual_target_weight) * enhancement_residual_target
         + float(args.enhancement_leak_weight) * enhancement_leak
-        + float(args.top_intensity_weight) * top_intensity
+        + top_intensity_weight * top_intensity
         + float(args.prompt_weight) * prompt
         + float(args.prompt_balanced_bce_weight) * prompt_bce
+        + float(args.medical_prompt_aux_weight) * medical_prompt_aux
     )
     return loss, {
         "loss": float(loss.detach().cpu().item()),
@@ -2320,8 +2997,15 @@ def loss_for_batch(
         "enhancement_residual_target": float(enhancement_residual_target.detach().cpu().item()),
         "enhancement_leak": float(enhancement_leak.detach().cpu().item()),
         "top_intensity": float(top_intensity.detach().cpu().item()),
+        "effective_lesion_texture_weight": float(lesion_texture_weight),
+        "effective_edge_weight": float(edge_weight),
+        "effective_enhancement_under_weight": float(enhancement_under_weight),
+        "effective_lesion_boundary_weight": float(lesion_boundary_weight),
+        "effective_enhancement_contrast_weight": float(enhancement_contrast_weight),
+        "effective_top_intensity_weight": float(top_intensity_weight),
         "prompt_loss": float(prompt.detach().cpu().item()),
         "prompt_balanced_bce": float(prompt_bce.detach().cpu().item()),
+        "medical_prompt_aux": float(medical_prompt_aux.detach().cpu().item()),
         "uncertainty_mean": float(uncertainty.detach().mean().cpu().item()),
         "confidence_mean": float(generated["confidence"].detach().mean().cpu().item()),
         "stage1_mae": float(
@@ -2559,7 +3243,11 @@ def eval_metric(metrics: dict[str, float], key: str, default: float = float("inf
     return value
 
 
-def selection_score(metrics: dict[str, float], mode: str) -> float:
+def selection_score(
+    metrics: dict[str, float],
+    mode: str,
+    target_modality: str = "t1c",
+) -> float:
     if mode == "mae":
         return eval_metric(metrics, "mae")
     if mode not in {"lesion_composite", "lesion_noharm_composite"}:
@@ -2579,19 +3267,23 @@ def selection_score(metrics: dict[str, float], mode: str) -> float:
             ]
         ),
     )
+    selection_weights = modality_profile(target_modality)["selection"]
     score = (
-        0.35 * mae
-        + 0.20 * eval_metric(metrics, "high_tumor_mae", mae)
-        + 0.16 * eval_metric(metrics, "high_tumor_under", mae)
-        + 0.12 * eval_metric(metrics, "mae_ET", mae)
-        + 0.08 * eval_metric(metrics, "mae_TC", mae)
-        + 0.04 * eval_metric(metrics, "mae_WT", mae)
-        + 0.03 * eval_metric(metrics, "edge_mae", mae)
-        + 0.02 * eval_metric(metrics, "laplacian_mae", mae)
+        float(selection_weights.get("mae", 0.35)) * mae
+        + float(selection_weights.get("high_tumor_mae", 0.0))
+        * eval_metric(metrics, "high_tumor_mae", mae)
+        + float(selection_weights.get("high_tumor_under", 0.0))
+        * eval_metric(metrics, "high_tumor_under", mae)
+        + float(selection_weights.get("mae_ET", 0.0)) * eval_metric(metrics, "mae_ET", mae)
+        + float(selection_weights.get("mae_TC", 0.0)) * eval_metric(metrics, "mae_TC", mae)
+        + float(selection_weights.get("mae_WT", 0.0)) * eval_metric(metrics, "mae_WT", mae)
+        + float(selection_weights.get("edge_mae", 0.03)) * eval_metric(metrics, "edge_mae", mae)
+        + float(selection_weights.get("laplacian_mae", 0.02))
+        * eval_metric(metrics, "laplacian_mae", mae)
         + 0.08 * eval_metric(metrics, "refinement_harm_rate", 0.0)
         + 0.08 * eval_metric(metrics, "lesion_harm_rate", 0.0)
         + 0.04 * eval_metric(metrics, "background_delta_from_stage1", 0.0)
-        + 0.04 * ssim_penalty
+        + float(selection_weights.get("ssim", 0.04)) * ssim_penalty
         + 0.04 * float(lesion_ssim_penalty)
     )
     if mode == "lesion_noharm_composite":
@@ -2617,6 +3309,37 @@ def selection_score(metrics: dict[str, float], mode: str) -> float:
     return float(score)
 
 
+def save_step_checkpoint(
+    model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    epoch: int,
+    step: int,
+    parts: dict[str, float],
+) -> Path:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / str(args.step_checkpoint_name)
+    tmp_path = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "config": vars(args),
+            "target_modality": args.target_modality,
+            "modalities": BRATS_MODALITIES,
+            "checkpoint_type": "step",
+            "epoch": int(epoch),
+            "step": int(step),
+            "last_train_parts": parts,
+            "created_time": time.time(),
+        },
+        tmp_path,
+    )
+    tmp_path.replace(checkpoint_path)
+    return checkpoint_path
+
+
 def train_one_epoch(
     model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
     loader: DataLoader,
@@ -2630,6 +3353,7 @@ def train_one_epoch(
     losses = []
     started = time.perf_counter()
     last_log = started
+    step_checkpoint_every = int(max(0, getattr(args, "step_checkpoint_every", 0)))
     for step, batch in enumerate(loader):
         if args.max_train_steps > 0 and step >= args.max_train_steps:
             break
@@ -2646,12 +3370,35 @@ def train_one_epoch(
             parts["grad_norm"] = float("nan")
             parts["skipped_nonfinite_grad"] = True
             parts["nonfinite_grad_values"] = nonfinite_grad_values
+            parts["step_checkpoint_written"] = False
             losses.append(parts)
             continue
         optimizer.step()
         parts["grad_norm"] = float(grad_norm.detach().cpu().item())
         parts["skipped_nonfinite_grad"] = False
         parts["nonfinite_grad_values"] = nonfinite_grad_values
+        parts["step_checkpoint_written"] = False
+        if step_checkpoint_every > 0 and (step + 1) % step_checkpoint_every == 0:
+            checkpoint_path = save_step_checkpoint(
+                model,
+                optimizer,
+                args,
+                epoch,
+                step + 1,
+                parts,
+            )
+            parts["step_checkpoint_written"] = True
+            print(
+                json.dumps(
+                    {
+                        "event": "step_checkpoint",
+                        "epoch": epoch,
+                        "step": step + 1,
+                        "path": str(checkpoint_path),
+                    }
+                ),
+                flush=True,
+            )
         losses.append(parts)
         if args.log_every > 0 and (step + 1) % args.log_every == 0:
             now = time.perf_counter()
@@ -2704,6 +3451,8 @@ def build_model(
             SliceDriftTransportGeneratorConfig(
                 hidden_channels=args.hidden_channels,
                 in_modalities=in_modalities,
+                base_modalities=len(BRATS_MODALITIES),
+                target_base_index=BRATS_MODALITIES.index(args.target_modality),
                 transport_steps=args.transport_steps,
                 transport_step_scale=args.transport_step_scale,
                 velocity_scale=args.transport_velocity_scale,
@@ -2711,6 +3460,12 @@ def build_model(
                 class_channels=len(BRATS_DATASETS),
                 class_conditioned=args.class_conditioned,
                 output_activation=args.output_activation,
+                medical_role_conditioning=args.medical_role_conditioning,
+                learned_initial_state=args.learned_initial_state,
+                medical_prompt_conditioning=args.medical_prompt_conditioning,
+                role_hidden_channels=args.role_hidden_channels,
+                initial_residual_scale=args.initial_residual_scale,
+                prompt_channels=args.medical_prompt_channels,
                 gated_refinement=args.gated_refinement,
                 refinement_residual_scale=args.refinement_residual_scale,
                 gate_bias_init=args.gate_bias_init,
@@ -3037,6 +3792,14 @@ def sanitize_gradients(model: torch.nn.Module) -> int:
     return replaced
 
 
+def optimizer_to_device(optimizer: torch.optim.Optimizer, device: str) -> None:
+    torch_device = torch.device(device)
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.to(torch_device)
+
+
 def main() -> int:
     args = parse_args()
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -3069,6 +3832,7 @@ def main() -> int:
         slice_crop_jitter=args.slice_crop_jitter,
         slice_crop_mode=val_slice_crop_mode,
         slice_context_radius=args.slice_context_radius,
+        slice_sampling_mode="tumor",
     )
     train_dataset = BraTSSliceDataset(
         args.manifest,
@@ -3083,6 +3847,12 @@ def main() -> int:
         slice_context_radius=args.slice_context_radius,
         hard_slices=hard_slices,
         hard_slice_prob=args.hard_slice_prob,
+        target_aware_sampling=args.target_aware_medical_defaults,
+        slice_sampling_mode=args.slice_sampling_mode,
+        mixed_background_prob=args.mixed_background_prob,
+        mixed_et_prob=args.mixed_et_prob,
+        mixed_tc_prob=args.mixed_tc_prob,
+        mixed_wt_prob=args.mixed_wt_prob,
     )
     val_dataset = split_dataset
     split_seed = int(args.seed if int(args.split_seed) < 0 else args.split_seed)
@@ -3102,8 +3872,10 @@ def main() -> int:
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
     model = build_model(args).to(args.device)
     resume_report = None
+    resume_payload: dict[str, Any] | None = None
     if args.resume_checkpoint:
         payload = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
+        resume_payload = payload
         checkpoint_target = str(
             payload.get(
                 "target_modality",
@@ -3128,6 +3900,9 @@ def main() -> int:
             "partial_shape_loads": partial_shape_loads,
             "source_model_kind": payload.get("config", {}).get("model_kind", "slice"),
             "target_model_kind": args.model_kind,
+            "checkpoint_type": payload.get("checkpoint_type", "epoch_or_final"),
+            "checkpoint_epoch": payload.get("epoch"),
+            "checkpoint_step": payload.get("step"),
         }
     lesion_reset = reset_lesion_residual_head(model, args.reset_lesion_residual_bias)
     freeze_report = (
@@ -3146,6 +3921,22 @@ def main() -> int:
     if not optimizer_parameters:
         raise RuntimeError("No trainable parameters selected")
     optimizer = torch.optim.AdamW(optimizer_parameters, lr=args.lr, weight_decay=1e-4)
+    optimizer_resume_report = {"loaded": False, "reason": "no optimizer state in checkpoint"}
+    if resume_payload is not None and "optimizer" in resume_payload:
+        try:
+            optimizer.load_state_dict(resume_payload["optimizer"])
+            optimizer_to_device(optimizer, args.device)
+            optimizer_resume_report = {
+                "loaded": True,
+                "checkpoint_type": resume_payload.get("checkpoint_type", "unknown"),
+                "checkpoint_epoch": resume_payload.get("epoch"),
+                "checkpoint_step": resume_payload.get("step"),
+            }
+        except (ValueError, RuntimeError) as exc:
+            optimizer_resume_report = {
+                "loaded": False,
+                "reason": type(exc).__name__ + ": " + str(exc),
+            }
     medical_bank = (
         MedicalDriftBank2D(
             max_tokens=args.medical_drift_bank_size,
@@ -3178,7 +3969,7 @@ def main() -> int:
             medical_bank,
         )
         eval_report = evaluate(model, val_loader, args.device)
-        eval_score = selection_score(eval_report, args.best_metric)
+        eval_score = selection_score(eval_report, args.best_metric, args.target_modality)
         eval_report = dict(eval_report)
         eval_report["selection_score"] = float(eval_score)
         print(
@@ -3225,11 +4016,13 @@ def main() -> int:
         "git_commit": git_commit(),
         "environment": environment(args.device),
         "config": vars(args),
+        "medical_profile": modality_profile(args.target_modality),
         "derived_config": {
             "val_slice_crop_size": val_slice_crop_size,
             "val_slice_crop_mode": val_slice_crop_mode,
         },
         "resume": resume_report,
+        "optimizer_resume": optimizer_resume_report,
         "lesion_residual_head_reset": lesion_reset,
         "freeze": freeze_report,
         "split": split_report,

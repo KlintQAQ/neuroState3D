@@ -12,6 +12,8 @@ from models.slice_virtual_modality_generator import ConvNormAct2d, ResidualConvB
 @dataclass(frozen=True)
 class SliceDriftTransportGeneratorConfig:
     in_modalities: int = 4
+    base_modalities: int = 4
+    target_base_index: int = 1
     hidden_channels: int = 32
     transport_steps: int = 4
     transport_step_scale: float = 1.0
@@ -29,6 +31,12 @@ class SliceDriftTransportGeneratorConfig:
     refinement_channels_multiplier: int = 1
     refinement_blocks: int = 1
     refinement_detail_features: bool = False
+    medical_role_conditioning: bool = False
+    learned_initial_state: bool = False
+    medical_prompt_conditioning: bool = False
+    role_hidden_channels: int = 0
+    initial_residual_scale: float = 0.35
+    prompt_channels: int = 5
 
 
 class SliceDriftTransportGenerator(nn.Module):
@@ -49,7 +57,48 @@ class SliceDriftTransportGenerator(nn.Module):
         self.config = config or SliceDriftTransportGeneratorConfig()
         hidden = int(self.config.hidden_channels)
         class_channels = int(self.config.class_channels) if self.config.class_conditioned else 0
-        in_channels = int(self.config.in_modalities) * 2 + 3 + class_channels
+        self.base_modalities = max(1, int(self.config.base_modalities))
+        self.context_depth = max(1, int(self.config.in_modalities) // self.base_modalities)
+        role_enabled = bool(self.config.medical_role_conditioning)
+        role_hidden = int(self.config.role_hidden_channels) or max(8, hidden // 2)
+        self.role_condition_channels = hidden if role_enabled else 0
+        self.prompt_condition_channels = (
+            max(3, int(self.config.prompt_channels))
+            if bool(self.config.medical_prompt_conditioning)
+            else 0
+        )
+        if role_enabled:
+            per_role_channels = self.context_depth * 2
+            self.role_stems = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        ConvNormAct2d(per_role_channels, role_hidden),
+                        ResidualConvBlock2d(role_hidden),
+                    )
+                    for _ in range(self.base_modalities)
+                ]
+            )
+            fusion_in_channels = role_hidden * self.base_modalities + class_channels
+            self.role_fusion = nn.Sequential(
+                ConvNormAct2d(fusion_in_channels, hidden),
+                ResidualConvBlock2d(hidden),
+            )
+            self.initial_residual_head = nn.Conv2d(hidden, 1, kernel_size=1)
+            nn.init.zeros_(self.initial_residual_head.weight)
+            nn.init.zeros_(self.initial_residual_head.bias)
+            if self.prompt_condition_channels > 0:
+                self.medical_prompt_head = nn.Sequential(
+                    ConvNormAct2d(hidden, hidden),
+                    ResidualConvBlock2d(hidden),
+                    nn.Conv2d(hidden, self.prompt_condition_channels, kernel_size=1),
+                )
+        in_channels = (
+            int(self.config.in_modalities) * 2
+            + 3
+            + class_channels
+            + self.role_condition_channels
+            + self.prompt_condition_channels
+        )
         self.stem = nn.Sequential(
             ConvNormAct2d(in_channels, hidden),
             ResidualConvBlock2d(hidden),
@@ -84,7 +133,14 @@ class SliceDriftTransportGenerator(nn.Module):
         nn.init.zeros_(self.velocity_head.bias)
         if self.config.gated_refinement:
             detail_channels = 8 if bool(self.config.refinement_detail_features) else 0
-            refinement_in_channels = int(self.config.in_modalities) * 2 + 3 + class_channels + detail_channels
+            refinement_in_channels = (
+                int(self.config.in_modalities) * 2
+                + 3
+                + class_channels
+                + detail_channels
+                + self.role_condition_channels
+                + self.prompt_condition_channels
+            )
             refinement_hidden = hidden * max(1, int(self.config.refinement_channels_multiplier))
             refinement_blocks = max(1, int(self.config.refinement_blocks))
             refinement_layers: list[nn.Module] = [ConvNormAct2d(refinement_in_channels, refinement_hidden)]
@@ -129,7 +185,12 @@ class SliceDriftTransportGenerator(nn.Module):
         class_map = self._class_map(class_condition, b, h, w, slices)
         masked = slices * modality_mask.view(b, m, 1, 1)
         mask_channels = modality_mask.view(b, m, 1, 1).expand(b, m, h, w)
-        current = self._initial_state(masked, modality_mask)
+        role_context, prompt_logits, prompt_probs = self._medical_conditioning(
+            masked,
+            mask_channels,
+            class_map,
+        )
+        current = self._initial_state(masked, modality_mask, role_context)
         states = [current]
         velocities = []
         uncertainty_raw = None
@@ -145,6 +206,8 @@ class SliceDriftTransportGenerator(nn.Module):
                 progress,
                 remaining,
                 class_map,
+                role_context,
+                prompt_probs,
             )
             current = self._activate(
                 current + float(self.config.transport_step_scale) * velocity
@@ -178,6 +241,10 @@ class SliceDriftTransportGenerator(nn.Module):
                 refinement_inputs.append(
                     self._refinement_detail_features(masked, mask_channels, stage1, source_energy)
                 )
+            if role_context is not None:
+                refinement_inputs.append(role_context)
+            if prompt_probs is not None:
+                refinement_inputs.append(prompt_probs)
             refinement_features = self.refinement_context(torch.cat(refinement_inputs, dim=1))
             refinement_features = refinement_features + self.refinement_feature_project(last_features)
             refinement_gate_logits = self.refinement_gate_head(refinement_features)
@@ -223,6 +290,10 @@ class SliceDriftTransportGenerator(nn.Module):
                     "refinement_acceptance_logits": refinement_acceptance_logits,
                 }
             )
+        if prompt_logits is not None:
+            output["medical_prompt_logits"] = prompt_logits
+            output["medical_prompt_probs"] = prompt_probs
+            output["prompt_logits"] = prompt_logits[:, :3]
         return output
 
     def _class_map(
@@ -259,15 +330,22 @@ class SliceDriftTransportGenerator(nn.Module):
         self,
         masked: torch.Tensor,
         modality_mask: torch.Tensor,
+        role_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        weights = modality_mask.view(modality_mask.shape[0], modality_mask.shape[1], 1, 1)
-        count = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
-        current = masked.sum(dim=1, keepdim=True) / count
+        current = self._role_weighted_prior(masked, modality_mask)
         kernel = int(self.config.init_blur_kernel)
         if kernel > 1:
             if kernel % 2 == 0:
                 kernel += 1
             current = F.avg_pool2d(current, kernel_size=kernel, stride=1, padding=kernel // 2)
+        if (
+            bool(self.config.learned_initial_state)
+            and role_context is not None
+            and hasattr(self, "initial_residual_head")
+        ):
+            current = current + float(self.config.initial_residual_scale) * torch.tanh(
+                self.initial_residual_head(role_context)
+            )
         return self._activate(current)
 
     def _velocity_step(
@@ -278,6 +356,8 @@ class SliceDriftTransportGenerator(nn.Module):
         progress: float,
         remaining: float,
         class_map: torch.Tensor | None,
+        role_context: torch.Tensor | None,
+        prompt_probs: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         b, _, h, w = current.shape
         progress_map = current.new_full((b, 1, h, w), float(progress))
@@ -285,6 +365,10 @@ class SliceDriftTransportGenerator(nn.Module):
         inputs = [current, masked, mask_channels, progress_map, remaining_map]
         if class_map is not None:
             inputs.append(class_map)
+        if role_context is not None:
+            inputs.append(role_context)
+        if prompt_probs is not None:
+            inputs.append(prompt_probs)
         x0 = self.stem(torch.cat(inputs, dim=1))
         x1 = self.down1(x0)
         x2 = self.bottleneck(self.down2(x1))
@@ -295,6 +379,102 @@ class SliceDriftTransportGenerator(nn.Module):
         velocity = float(self.config.velocity_scale) * torch.tanh(self.velocity_head(x))
         uncertainty_raw = self.uncertainty_head(x)
         return velocity, uncertainty_raw, x
+
+    def _medical_conditioning(
+        self,
+        masked: torch.Tensor,
+        mask_channels: torch.Tensor,
+        class_map: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        if not bool(self.config.medical_role_conditioning):
+            return None, None, None
+        if masked.shape[1] != self.base_modalities * self.context_depth:
+            return None, None, None
+        role_features = []
+        for modality_index, stem in enumerate(self.role_stems):
+            start = modality_index * self.context_depth
+            end = start + self.context_depth
+            role_input = torch.cat(
+                [masked[:, start:end], mask_channels[:, start:end]],
+                dim=1,
+            )
+            role_features.append(stem(role_input))
+        fusion_inputs = [torch.cat(role_features, dim=1)]
+        if class_map is not None:
+            fusion_inputs.append(class_map)
+        role_context = self.role_fusion(torch.cat(fusion_inputs, dim=1))
+        prompt_logits = None
+        prompt_probs = None
+        if self.prompt_condition_channels > 0 and hasattr(self, "medical_prompt_head"):
+            prompt_logits = self.medical_prompt_head(role_context)
+            prompt_probs = torch.sigmoid(prompt_logits)
+        return role_context, prompt_logits, prompt_probs
+
+    def _role_weighted_prior(
+        self,
+        masked: torch.Tensor,
+        modality_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        b, m, h, w = masked.shape
+        weights = modality_mask.to(device=masked.device, dtype=masked.dtype).view(b, m, 1, 1)
+        if m != self.base_modalities * self.context_depth:
+            count = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+            return masked.sum(dim=1, keepdim=True) / count
+
+        target = int(self.config.target_base_index)
+        base_weights = self._target_role_weights(masked.device, masked.dtype)
+        if 0 <= target < self.base_modalities:
+            base_weights[target] = 0.0
+
+        center = self.context_depth // 2
+        context_weights = masked.new_tensor(
+            [1.0 / (1.0 + abs(index - center)) for index in range(self.context_depth)]
+        )
+        role_weights = torch.cat(
+            [
+                base_weights[modality_index].repeat(self.context_depth) * context_weights
+                for modality_index in range(self.base_modalities)
+            ],
+            dim=0,
+        ).view(1, m, 1, 1)
+        weighted_mask = weights * role_weights
+        denom = weighted_mask.sum(dim=1, keepdim=True)
+        fallback_denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+        fallback = masked.sum(dim=1, keepdim=True) / fallback_denom
+        prior = (masked * weighted_mask).sum(dim=1, keepdim=True) / denom.clamp_min(1e-6)
+        return torch.where(denom > 1e-6, prior, fallback)
+
+    def _target_role_weights(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Return source-modality weights for the target BraTS contrast.
+
+        BraTS channel order is T1n, T1c, T2w, T2-FLAIR. The weights only form
+        the drift starting point; the velocity network still receives every
+        observed modality and mask channel.
+        """
+
+        weights = torch.ones(self.base_modalities, device=device, dtype=dtype)
+        target = int(self.config.target_base_index)
+        if self.base_modalities >= 4:
+            if target == 0:
+                # T1n is mostly anatomy. T1c has the closest tissue contrast
+                # but may contain enhancement that the learned residual should
+                # remove; FLAIR/T2 provide lesion context.
+                weights = torch.tensor([0.0, 0.56, 0.14, 0.30], device=device, dtype=dtype)
+            elif target == 1:
+                # T1c keeps T1n anatomy, then adds enhancement guided by FLAIR
+                # edema extent and a smaller T2w water-content cue.
+                weights = torch.tensor([0.72, 0.0, 0.06, 0.22], device=device, dtype=dtype)
+            elif target == 2:
+                # T2w is water/edema sensitive. FLAIR is the strongest lesion
+                # partner, while T1/T1c anchor ventricles and anatomy.
+                weights = torch.tensor([0.16, 0.20, 0.0, 0.64], device=device, dtype=dtype)
+            elif target == 3:
+                # FLAIR behaves like T2 with CSF suppression, so T2w anchors
+                # lesion hyperintensity and T1/T1c help separate anatomy/core.
+                weights = torch.tensor([0.20, 0.18, 0.62, 0.0], device=device, dtype=dtype)
+        if 0 <= target < self.base_modalities:
+            weights[target] = 0.0
+        return weights
 
     def _refinement_detail_features(
         self,
