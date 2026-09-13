@@ -252,6 +252,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--medical-role-conditioning", action="store_true")
     parser.add_argument("--learned-initial-state", action="store_true")
     parser.add_argument("--medical-prompt-conditioning", action="store_true")
+    parser.add_argument(
+        "--stochastic-initial-state",
+        action="store_true",
+        help="Sample a conditional initial state during training; evaluation remains deterministic unless explicitly sampled.",
+    )
+    parser.add_argument("--stochastic-noise-scale", type=float, default=0.05)
     parser.add_argument("--role-hidden-channels", type=int, default=0)
     parser.add_argument("--initial-residual-scale", type=float, default=0.35)
     parser.add_argument("--medical-prompt-channels", type=int, default=5)
@@ -357,6 +363,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-seed", type=int, default=-1)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--step-checkpoint-every", type=int, default=0)
+    parser.add_argument("--checkpoint-keep-last", type=int, default=3)
     parser.add_argument(
         "--step-checkpoint-name",
         default="slice_virtual_modality_generator_step.pt",
@@ -378,6 +385,62 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def capture_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: dict[str, Any] | None) -> None:
+    if not state:
+        return
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def exact_resume_config_mismatches(
+    checkpoint_config: dict[str, Any],
+    current_config: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    operational_keys = {
+        "resume_checkpoint",
+        "output_dir",
+        "report_path",
+        "device",
+        "epochs",
+        "num_workers",
+        "log_every",
+        "step_checkpoint_every",
+        "checkpoint_keep_last",
+        "step_checkpoint_name",
+    }
+    mismatches: dict[str, dict[str, Any]] = {}
+    for key, current_value in current_config.items():
+        if key in operational_keys:
+            continue
+        if key not in checkpoint_config:
+            mismatches[key] = {"checkpoint": "<missing>", "current": current_value}
+            continue
+        checkpoint_value = checkpoint_config[key]
+        if checkpoint_value != current_value:
+            mismatches[key] = {
+                "checkpoint": checkpoint_value,
+                "current": current_value,
+            }
+    return mismatches
 
 
 def modality_profile(target_modality: str) -> dict[str, Any]:
@@ -555,6 +618,7 @@ class BraTSSliceDataset(Dataset):
         mixed_et_prob: float = 0.30,
         mixed_tc_prob: float = 0.25,
         mixed_wt_prob: float = 0.25,
+        enumerate_all_slices: bool = False,
     ) -> None:
         rows = read_rows(manifest_csv)
         if max_subjects is not None:
@@ -563,7 +627,12 @@ class BraTSSliceDataset(Dataset):
             raise ValueError(f"No rows selected from {manifest_csv}")
         self.rows = rows
         self.spatial_size = int(spatial_size)
-        self.slices_per_subject = int(max(1, slices_per_subject))
+        self.enumerate_all_slices = bool(enumerate_all_slices)
+        self.slices_per_subject = (
+            int(self.spatial_size)
+            if self.enumerate_all_slices
+            else int(max(1, slices_per_subject))
+        )
         self.base_target_index = BRATS_MODALITIES.index(target_modality)
         self.slice_context_radius = int(max(0, slice_context_radius))
         self.context_depth = 2 * self.slice_context_radius + 1
@@ -581,6 +650,10 @@ class BraTSSliceDataset(Dataset):
         self.mixed_et_prob = float(max(0.0, mixed_et_prob))
         self.mixed_tc_prob = float(max(0.0, mixed_tc_prob))
         self.mixed_wt_prob = float(max(0.0, mixed_wt_prob))
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(max(0, epoch))
 
     def __len__(self) -> int:
         return len(self.rows) * self.slices_per_subject
@@ -591,8 +664,17 @@ class BraTSSliceDataset(Dataset):
         row = self.rows[row_index]
         image = np.load(row["multimodal_path"]).astype(np.float32, copy=False)
         seg = np.load(row["seg_path"]).astype(np.int64, copy=False)
-        rng = random.Random(self.seed + row_index * 1009 + local_index * 9176)
-        z = self._sample_slice(seg, rng, row["subject_id"])
+        rng = random.Random(
+            self.seed
+            + self.epoch * 1_000_003
+            + row_index * 1009
+            + local_index * 9176
+        )
+        z = (
+            min(int(local_index), int(seg.shape[-1]) - 1)
+            if self.enumerate_all_slices
+            else self._sample_slice(seg, rng, row["subject_id"])
+        )
         image_slice = self._context_slices(image, z)
         target = torch.from_numpy(brats_region_targets_np(seg[:, :, z]))
         if self.slice_crop_mode == "region_balanced" and self.slice_crop_size > 0:
@@ -2177,6 +2259,23 @@ class _TokenStore:
         indices = torch.randint(0, tokens.shape[0], (count,))
         return tokens[indices]
 
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "max_tokens": self.max_tokens,
+            "max_add_tokens": self.max_add_tokens,
+            "storage": {key: value.clone() for key, value in self._storage.items()},
+        }
+
+    def load_state_dict(self, state: dict[str, Any] | None) -> None:
+        if not state:
+            return
+        storage = state.get("storage", {})
+        self._storage = {
+            str(key): value.detach().cpu().float()
+            for key, value in storage.items()
+            if torch.is_tensor(value)
+        }
+
 
 class MedicalDriftBank2D:
     def __init__(
@@ -2381,6 +2480,19 @@ class MedicalDriftBank2D:
             "bank_pos_key_count": self.positive.key_count(),
             "bank_neg_key_count": self.negative.key_count(),
         }
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "positive": self.positive.state_dict(),
+            "negative": self.negative.state_dict(),
+            "memory_tokens": self.memory_tokens,
+        }
+
+    def load_state_dict(self, state: dict[str, Any] | None) -> None:
+        if not state:
+            return
+        self.positive.load_state_dict(state.get("positive"))
+        self.negative.load_state_dict(state.get("negative"))
 
 
 def medical_multilevel_drift_loss(
@@ -3314,15 +3426,19 @@ def save_step_checkpoint(
     optimizer: torch.optim.Optimizer,
     args: argparse.Namespace,
     epoch: int,
-    step: int,
+    step_in_epoch: int,
+    global_step: int,
     parts: dict[str, float],
+    medical_bank: MedicalDriftBank2D | None,
+    training_state: dict[str, Any],
 ) -> Path:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / str(args.step_checkpoint_name)
+    checkpoint_path = output_dir / f"checkpoint_step_{int(global_step):09d}.pt"
     tmp_path = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
     torch.save(
         {
+            "resume_format_version": 2,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "config": vars(args),
@@ -3330,13 +3446,23 @@ def save_step_checkpoint(
             "modalities": BRATS_MODALITIES,
             "checkpoint_type": "step",
             "epoch": int(epoch),
-            "step": int(step),
+            "step": int(step_in_epoch),
+            "step_in_epoch": int(step_in_epoch),
+            "global_step": int(global_step),
+            "rng_state": capture_rng_state(),
+            "medical_drift_bank": medical_bank.state_dict() if medical_bank is not None else None,
+            "training_state": dict(training_state),
             "last_train_parts": parts,
             "created_time": time.time(),
         },
         tmp_path,
     )
     tmp_path.replace(checkpoint_path)
+    keep_last = int(max(0, getattr(args, "checkpoint_keep_last", 0)))
+    if keep_last > 0:
+        checkpoints = sorted(output_dir.glob("checkpoint_step_*.pt"))
+        for stale in checkpoints[:-keep_last]:
+            stale.unlink(missing_ok=True)
     return checkpoint_path
 
 
@@ -3348,7 +3474,10 @@ def train_one_epoch(
     args: argparse.Namespace,
     epoch: int,
     medical_bank: MedicalDriftBank2D | None = None,
-) -> dict[str, Any]:
+    start_step: int = 0,
+    global_step: int = 0,
+    checkpoint_state: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], int]:
     model.train()
     losses = []
     started = time.perf_counter()
@@ -3357,6 +3486,9 @@ def train_one_epoch(
     for step, batch in enumerate(loader):
         if args.max_train_steps > 0 and step >= args.max_train_steps:
             break
+        step_in_epoch = step + 1
+        if step_in_epoch <= int(start_step):
+            continue
         batch = to_device(batch, device)
         loss, parts = loss_for_batch(model, batch, args, medical_bank)
         if not torch.isfinite(loss).item():
@@ -3374,18 +3506,22 @@ def train_one_epoch(
             losses.append(parts)
             continue
         optimizer.step()
+        global_step += 1
         parts["grad_norm"] = float(grad_norm.detach().cpu().item())
         parts["skipped_nonfinite_grad"] = False
         parts["nonfinite_grad_values"] = nonfinite_grad_values
         parts["step_checkpoint_written"] = False
-        if step_checkpoint_every > 0 and (step + 1) % step_checkpoint_every == 0:
+        if step_checkpoint_every > 0 and global_step % step_checkpoint_every == 0:
             checkpoint_path = save_step_checkpoint(
                 model,
                 optimizer,
                 args,
                 epoch,
-                step + 1,
+                step_in_epoch,
+                global_step,
                 parts,
+                medical_bank,
+                checkpoint_state or {},
             )
             parts["step_checkpoint_written"] = True
             print(
@@ -3393,20 +3529,22 @@ def train_one_epoch(
                     {
                         "event": "step_checkpoint",
                         "epoch": epoch,
-                        "step": step + 1,
+                        "step": step_in_epoch,
+                        "global_step": global_step,
                         "path": str(checkpoint_path),
                     }
                 ),
                 flush=True,
             )
         losses.append(parts)
-        if args.log_every > 0 and (step + 1) % args.log_every == 0:
+        if args.log_every > 0 and step_in_epoch % args.log_every == 0:
             now = time.perf_counter()
             print(
                 json.dumps(
                     {
                         "epoch": epoch,
-                        "step": step + 1,
+                        "step": step_in_epoch,
+                        "global_step": global_step,
                         **parts,
                         "elapsed_sec": now - started,
                         "sec_since_last_log": now - last_log,
@@ -3423,7 +3561,7 @@ def train_one_epoch(
         "first_loss": losses[0] if losses else None,
         "last_loss": losses[-1] if losses else None,
         "runtime_sec": time.perf_counter() - started,
-    }
+    }, int(global_step)
 
 
 def build_model(
@@ -3463,6 +3601,8 @@ def build_model(
                 medical_role_conditioning=args.medical_role_conditioning,
                 learned_initial_state=args.learned_initial_state,
                 medical_prompt_conditioning=args.medical_prompt_conditioning,
+                stochastic_initial_state=args.stochastic_initial_state,
+                stochastic_noise_scale=args.stochastic_noise_scale,
                 role_hidden_channels=args.role_hidden_channels,
                 initial_residual_scale=args.initial_residual_scale,
                 prompt_channels=args.medical_prompt_channels,
@@ -3863,16 +4003,20 @@ def main() -> int:
     )
     train_set = Subset(train_dataset, train_indices)
     val_set = Subset(val_dataset, val_indices)
+    train_shuffle_generator = torch.Generator()
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
+        generator=train_shuffle_generator,
     )
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
     model = build_model(args).to(args.device)
     resume_report = None
     resume_payload: dict[str, Any] | None = None
+    model_resume_exact = False
+    resume_config_mismatches: dict[str, dict[str, Any]] = {}
     if args.resume_checkpoint:
         payload = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
         resume_payload = payload
@@ -3892,6 +4036,13 @@ def main() -> int:
             checkpoint_state,
         )
         missing, unexpected = model.load_state_dict(checkpoint_state, strict=False)
+        model_resume_exact = not (
+            missing or unexpected or shape_mismatch or partial_shape_loads
+        )
+        resume_config_mismatches = exact_resume_config_mismatches(
+            dict(payload.get("config", {})),
+            vars(args),
+        )
         resume_report = {
             "path": args.resume_checkpoint,
             "missing_keys": list(missing),
@@ -3903,8 +4054,22 @@ def main() -> int:
             "checkpoint_type": payload.get("checkpoint_type", "epoch_or_final"),
             "checkpoint_epoch": payload.get("epoch"),
             "checkpoint_step": payload.get("step"),
+            "checkpoint_global_step": payload.get("global_step"),
+            "model_exact": model_resume_exact,
+            "config_mismatches": resume_config_mismatches,
+            "resume_format_version": payload.get("resume_format_version", 0),
         }
-    lesion_reset = reset_lesion_residual_head(model, args.reset_lesion_residual_bias)
+    resumable_model_state = bool(
+        resume_payload is not None
+        and model_resume_exact
+        and int(resume_payload.get("resume_format_version", 0)) >= 2
+        and not resume_config_mismatches
+    )
+    lesion_reset = (
+        False
+        if resumable_model_state
+        else reset_lesion_residual_head(model, args.reset_lesion_residual_bias)
+    )
     freeze_report = (
         freeze_prompted_base(
             model,
@@ -3922,7 +4087,13 @@ def main() -> int:
         raise RuntimeError("No trainable parameters selected")
     optimizer = torch.optim.AdamW(optimizer_parameters, lr=args.lr, weight_decay=1e-4)
     optimizer_resume_report = {"loaded": False, "reason": "no optimizer state in checkpoint"}
-    if resume_payload is not None and "optimizer" in resume_payload:
+    if (
+        resume_payload is not None
+        and model_resume_exact
+        and int(resume_payload.get("resume_format_version", 0)) >= 2
+        and not resume_config_mismatches
+        and "optimizer" in resume_payload
+    ):
         try:
             optimizer.load_state_dict(resume_payload["optimizer"])
             optimizer_to_device(optimizer, args.device)
@@ -3937,6 +4108,11 @@ def main() -> int:
                 "loaded": False,
                 "reason": type(exc).__name__ + ": " + str(exc),
             }
+    elif resume_payload is not None:
+        optimizer_resume_report = {
+            "loaded": False,
+            "reason": "checkpoint format, model state, or training configuration is not an exact match; optimizer state intentionally ignored",
+        }
     medical_bank = (
         MedicalDriftBank2D(
             max_tokens=args.medical_drift_bank_size,
@@ -3946,20 +4122,103 @@ def main() -> int:
         if float(args.medical_drift_weight) > 0.0
         else None
     )
+    checkpoint_type = str((resume_payload or {}).get("checkpoint_type", "warm_start"))
+    exact_resume = bool(
+        resume_payload is not None
+        and model_resume_exact
+        and int(resume_payload.get("resume_format_version", 0)) >= 2
+        and not resume_config_mismatches
+        and optimizer_resume_report.get("loaded", False)
+        and checkpoint_type in {"step", "epoch"}
+    )
+    effective_steps_per_epoch = len(train_loader)
+    if int(args.max_train_steps) > 0:
+        effective_steps_per_epoch = min(effective_steps_per_epoch, int(args.max_train_steps))
+    start_epoch = 0
+    start_step = 0
+    global_step = 0
+    restored_training_state: dict[str, Any] = {}
+    if exact_resume and resume_payload is not None:
+        restored_training_state = dict(resume_payload.get("training_state", {}))
+        global_step = int(
+            resume_payload.get(
+                "global_step",
+                int(resume_payload.get("epoch", 0)) * effective_steps_per_epoch
+                + int(resume_payload.get("step_in_epoch", resume_payload.get("step", 0))),
+            )
+        )
+        if checkpoint_type == "epoch":
+            start_epoch = int(resume_payload.get("epoch", -1)) + 1
+            start_step = 0
+        else:
+            start_epoch = int(resume_payload.get("epoch", 0))
+            start_step = int(
+                resume_payload.get("step_in_epoch", resume_payload.get("step", 0))
+            )
+        if medical_bank is not None:
+            medical_bank.load_state_dict(resume_payload.get("medical_drift_bank"))
+        restore_rng_state(resume_payload.get("rng_state"))
+        print(
+            json.dumps(
+                {
+                    "event": "exact_resume",
+                    "epoch": start_epoch,
+                    "step_in_epoch": start_step,
+                    "global_step": global_step,
+                }
+            ),
+            flush=True,
+        )
+    elif resume_payload is not None:
+        print(
+            json.dumps(
+                {
+                    "event": "warm_start",
+                    "reason": "checkpoint is partial, lacks optimizer state, or is not a resumable step/epoch checkpoint",
+                }
+            ),
+            flush=True,
+        )
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / "slice_virtual_modality_generator_last.pt"
     best_checkpoint_path = output_dir / "slice_virtual_modality_generator_best.pt"
-    best_eval = None
-    best_epoch = None
-    best_score = float("inf")
+    effective_best_metric = str(args.best_metric)
+    if (
+        effective_best_metric == "lesion_noharm_composite"
+        and not bool(getattr(model.config, "gated_refinement", False))
+    ):
+        effective_best_metric = "lesion_composite"
+        print(
+            json.dumps(
+                {
+                    "event": "best_metric_adjusted",
+                    "requested": args.best_metric,
+                    "effective": effective_best_metric,
+                    "reason": "no-harm deltas require gated refinement",
+                }
+            ),
+            flush=True,
+        )
+    best_eval = restored_training_state.get("best_eval")
+    best_epoch = restored_training_state.get("best_epoch")
+    best_score = float(restored_training_state.get("best_score", float("inf")))
     started = time.perf_counter()
-    epoch_reports = []
-    eval_reports = []
-    for epoch in range(args.epochs):
-        train_report = train_one_epoch(
+    epoch_reports = list(restored_training_state.get("epoch_reports", []))
+    eval_reports = list(restored_training_state.get("eval_reports", []))
+    for epoch in range(start_epoch, args.epochs):
+        train_dataset.set_epoch(epoch)
+        train_shuffle_generator.manual_seed(int(args.seed) + int(epoch) * 1_000_003)
+        checkpoint_state = {
+            "best_eval": best_eval,
+            "best_epoch": best_epoch,
+            "best_score": best_score,
+            "epoch_reports": epoch_reports,
+            "eval_reports": eval_reports,
+        }
+        train_report, global_step = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -3967,16 +4226,20 @@ def main() -> int:
             args,
             epoch,
             medical_bank,
+            start_step=start_step if epoch == start_epoch else 0,
+            global_step=global_step,
+            checkpoint_state=checkpoint_state,
         )
+        start_step = 0
         eval_report = evaluate(model, val_loader, args.device)
-        eval_score = selection_score(eval_report, args.best_metric, args.target_modality)
+        eval_score = selection_score(eval_report, effective_best_metric, args.target_modality)
         eval_report = dict(eval_report)
         eval_report["selection_score"] = float(eval_score)
         print(
             json.dumps(
                 {
                     "epoch": epoch,
-                    "best_metric": args.best_metric,
+                    "best_metric": effective_best_metric,
                     **eval_report,
                 }
             ),
@@ -3997,20 +4260,36 @@ def main() -> int:
                         "modalities": BRATS_MODALITIES,
                         "best_epoch": best_epoch,
                         "best_eval": best_eval,
-                        "best_metric": args.best_metric,
+                        "best_metric": effective_best_metric,
                         "best_score": best_score,
                     },
                     best_checkpoint_path,
                 )
-    torch.save(
-        {
+        epoch_payload = {
+            "resume_format_version": 2,
             "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
             "config": vars(args),
             "target_modality": args.target_modality,
             "modalities": BRATS_MODALITIES,
-        },
-        checkpoint_path,
-    )
+            "checkpoint_type": "epoch",
+            "epoch": int(epoch),
+            "step": int(effective_steps_per_epoch),
+            "step_in_epoch": int(effective_steps_per_epoch),
+            "global_step": int(global_step),
+            "rng_state": capture_rng_state(),
+            "medical_drift_bank": medical_bank.state_dict() if medical_bank is not None else None,
+            "training_state": {
+                "best_eval": best_eval,
+                "best_epoch": best_epoch,
+                "best_score": best_score,
+                "epoch_reports": epoch_reports,
+                "eval_reports": eval_reports,
+            },
+        }
+        tmp_checkpoint = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
+        torch.save(epoch_payload, tmp_checkpoint)
+        tmp_checkpoint.replace(checkpoint_path)
     report = {
         "verdict": "SLICE VIRTUAL MODALITY DRIFTING: PASS",
         "git_commit": git_commit(),
@@ -4020,6 +4299,7 @@ def main() -> int:
         "derived_config": {
             "val_slice_crop_size": val_slice_crop_size,
             "val_slice_crop_mode": val_slice_crop_mode,
+            "effective_best_metric": effective_best_metric,
         },
         "resume": resume_report,
         "optimizer_resume": optimizer_resume_report,
@@ -4034,7 +4314,7 @@ def main() -> int:
         "final_eval": eval_reports[-1]["metrics"] if eval_reports else {},
         "best_epoch": best_epoch,
         "best_eval": best_eval or {},
-        "best_metric": args.best_metric,
+        "best_metric": effective_best_metric,
         "best_score": best_score if best_epoch is not None else None,
         "best_checkpoint_path": str(best_checkpoint_path) if best_epoch is not None else None,
         "checkpoint_path": str(checkpoint_path),

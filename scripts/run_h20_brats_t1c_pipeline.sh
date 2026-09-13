@@ -31,7 +31,8 @@ ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_NAME="${RUN_NAME:-h20_t1c_transport_${STAMP}}"
+TARGET_MODALITY="${TARGET_MODALITY:-t1c}"
+RUN_NAME="${RUN_NAME:-h20_${TARGET_MODALITY}_transport_${STAMP}}"
 
 DATA_ROOT="${DATA_ROOT:-${ROOT}/data}"
 RAW_ROOT="${RAW_ROOT:-${DATA_ROOT}/raw/BraTS2023_HF}"
@@ -82,7 +83,6 @@ MIN_PROCESSED_SUBJECTS="${MIN_PROCESSED_SUBJECTS:-1}"
 ALLOW_PREPARE_FAILURES="${ALLOW_PREPARE_FAILURES:-0}"
 
 DEVICE="${DEVICE:-cuda}"
-TARGET_MODALITY="${TARGET_MODALITY:-t1c}"
 SPATIAL_SIZE="${SPATIAL_SIZE:-128}"
 MAX_SUBJECTS="${MAX_SUBJECTS:-0}"          # 0 means all subjects in the training script.
 VAL_SUBJECTS="${VAL_SUBJECTS:-128}"
@@ -96,6 +96,7 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 LOG_EVERY="${LOG_EVERY:-100}"
 STEP_CHECKPOINT_EVERY="${STEP_CHECKPOINT_EVERY:-0}"
+CHECKPOINT_KEEP_LAST="${CHECKPOINT_KEEP_LAST:-3}"
 SEED="${SEED:-46}"
 SPLIT_SEED="${SPLIT_SEED:-4601}"
 HIDDEN_CHANNELS="${HIDDEN_CHANNELS:-32}"
@@ -103,7 +104,7 @@ HIDDEN_CHANNELS="${HIDDEN_CHANNELS:-32}"
 BASE_EPOCHS="${BASE_EPOCHS:-8}"
 BASE_MAX_TRAIN_STEPS="${BASE_MAX_TRAIN_STEPS:-0}"
 BASE_LR="${BASE_LR:-2e-4}"
-BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-${OUTPUT_ROOT}/h20_prompted_base_t1c_128}"
+BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-${OUTPUT_ROOT}/h20_prompted_base_${TARGET_MODALITY}_128}"
 BASE_REPORT="${BASE_REPORT:-${REPORT_DIR}/${RUN_NAME}_base.json}"
 BASE_CHECKPOINT="${BASE_CHECKPOINT:-${BASE_OUTPUT_DIR}/slice_virtual_modality_generator_last.pt}"
 BASE_RESUME_CHECKPOINT="${BASE_RESUME_CHECKPOINT:-}"
@@ -129,7 +130,7 @@ TRANSPORT_INIT_BLUR_KERNEL="${TRANSPORT_INIT_BLUR_KERNEL:-5}"
 TRANSPORT_VELOCITY_WEIGHT="${TRANSPORT_VELOCITY_WEIGHT:-0.55}"
 TRANSPORT_PATH_WEIGHT="${TRANSPORT_PATH_WEIGHT:-0.25}"
 TRANSPORT_MONOTONIC_WEIGHT="${TRANSPORT_MONOTONIC_WEIGHT:-0.08}"
-TRANSPORT_BEST_METRIC="${TRANSPORT_BEST_METRIC:-lesion_noharm_composite}"
+TRANSPORT_BEST_METRIC="${TRANSPORT_BEST_METRIC:-lesion_composite}"
 TRANSPORT_PROMPT_WEIGHT="${TRANSPORT_PROMPT_WEIGHT:-0.08}"
 TRANSPORT_PROMPT_BALANCED_BCE_WEIGHT="${TRANSPORT_PROMPT_BALANCED_BCE_WEIGHT:-0.04}"
 TARGET_AWARE_MEDICAL_DEFAULTS="${TARGET_AWARE_MEDICAL_DEFAULTS:-1}"
@@ -137,6 +138,8 @@ CLASS_CONDITIONED="${CLASS_CONDITIONED:-1}"
 MEDICAL_ROLE_CONDITIONING="${MEDICAL_ROLE_CONDITIONING:-1}"
 LEARNED_INITIAL_STATE="${LEARNED_INITIAL_STATE:-1}"
 MEDICAL_PROMPT_CONDITIONING="${MEDICAL_PROMPT_CONDITIONING:-1}"
+STOCHASTIC_INITIAL_STATE="${STOCHASTIC_INITIAL_STATE:-0}"
+STOCHASTIC_NOISE_SCALE="${STOCHASTIC_NOISE_SCALE:-0.05}"
 ROLE_HIDDEN_CHANNELS="${ROLE_HIDDEN_CHANNELS:-0}"
 INITIAL_RESIDUAL_SCALE="${INITIAL_RESIDUAL_SCALE:-0.30}"
 MEDICAL_PROMPT_CHANNELS="${MEDICAL_PROMPT_CHANNELS:-6}"
@@ -205,6 +208,17 @@ REFINEMENT_NO_HARM_MARGIN="${REFINEMENT_NO_HARM_MARGIN:-0.0}"
 GATE_TARGET_DILATION="${GATE_TARGET_DILATION:-2}"
 
 VIS_NUM_CASES="${VIS_NUM_CASES:-12}"
+POSTERIOR_SAMPLES="${POSTERIOR_SAMPLES:-1}"
+RUN_FULL_VOLUME_EVAL="${RUN_FULL_VOLUME_EVAL:-1}"
+FULL_VOLUME_REPORT="${FULL_VOLUME_REPORT:-${REPORT_DIR}/${RUN_NAME}_full_volume.json}"
+FULL_VOLUME_BATCH_SLICES="${FULL_VOLUME_BATCH_SLICES:-32}"
+RUN_FUSION_EVAL="${RUN_FUSION_EVAL:-0}"
+FUSION_CHECKPOINT="${FUSION_CHECKPOINT:-}"
+BRAINMVP_CHECKPOINT="${BRAINMVP_CHECKPOINT:-${ROOT}/pretrained/BrainMVP_uniformer.pt}"
+FUSION_SPATIAL_SIZE="${FUSION_SPATIAL_SIZE:-96}"
+FUSION_CACHE_ROOT="${FUSION_CACHE_ROOT:-${DATA_ROOT}/generated/${RUN_NAME}_fusion}"
+FUSION_CACHE_MANIFEST="${FUSION_CACHE_MANIFEST:-${MANIFEST_DIR}/${RUN_NAME}_fusion_cache.csv}"
+FUSION_REPORT="${FUSION_REPORT:-${REPORT_DIR}/${RUN_NAME}_fusion.json}"
 VIS_CASE_SELECTION="${VIS_CASE_SELECTION:-representative}"
 VIS_CASE_SELECTIONS="${VIS_CASE_SELECTIONS:-${VIS_CASE_SELECTION}}"
 VIS_SELECTION_POOL="${VIS_SELECTION_POOL:-240}"
@@ -226,6 +240,26 @@ run_stage() {
   stage_log "CMD $*"
   "$@" > >(tee "${stdout_log}") 2> >(tee "${stderr_log}" >&2)
   stage_log "DONE ${name}"
+}
+
+latest_resume_checkpoint() {
+  local output_dir="$1"
+  local legacy_path="$2"
+  local epoch_path="$3"
+  local latest_step=""
+  if [[ -d "${output_dir}" ]]; then
+    latest_step="$(find "${output_dir}" -maxdepth 1 -type f -name 'checkpoint_step_*.pt' -print | sort | tail -n 1)"
+  fi
+  local newest=""
+  local candidate
+  for candidate in "${latest_step}" "${legacy_path}" "${epoch_path}"; do
+    if [[ -f "${candidate}" && ( -z "${newest}" || "${candidate}" -nt "${newest}" ) ]]; then
+      newest="${candidate}"
+    fi
+  done
+  if [[ -n "${newest}" ]]; then
+    printf '%s\n' "${newest}"
+  fi
 }
 
 csv_row_count() {
@@ -413,8 +447,10 @@ train_base_if_needed() {
     return
   fi
   local base_resume_checkpoint="${BASE_RESUME_CHECKPOINT}"
-  if [[ -z "${base_resume_checkpoint}" && -f "${BASE_STEP_CHECKPOINT}" ]]; then
-    base_resume_checkpoint="${BASE_STEP_CHECKPOINT}"
+  local latest_base_step
+  latest_base_step="$(latest_resume_checkpoint "${BASE_OUTPUT_DIR}" "${BASE_STEP_CHECKPOINT}" "${BASE_CHECKPOINT}")"
+  if [[ -z "${base_resume_checkpoint}" && -n "${latest_base_step}" ]]; then
+    base_resume_checkpoint="${latest_base_step}"
     stage_log "Resuming base training from step checkpoint: ${base_resume_checkpoint}"
   fi
 
@@ -471,6 +507,7 @@ train_base_if_needed() {
     --split-seed "${SPLIT_SEED}"
     --log-every "${LOG_EVERY}"
     --step-checkpoint-every "${STEP_CHECKPOINT_EVERY}"
+    --checkpoint-keep-last "${CHECKPOINT_KEEP_LAST}"
     --output-dir "${BASE_OUTPUT_DIR}"
     --report-path "${BASE_REPORT}"
   )
@@ -492,8 +529,10 @@ train_enhancement() {
     return
   fi
   local enhancement_resume_checkpoint="${TRANSPORT_RESUME_CHECKPOINT}"
-  if [[ -z "${enhancement_resume_checkpoint}" && ! -f "${FINAL_REPORT}" && -f "${FINAL_STEP_CHECKPOINT}" ]]; then
-    enhancement_resume_checkpoint="${FINAL_STEP_CHECKPOINT}"
+  local latest_enhancement_step
+  latest_enhancement_step="$(latest_resume_checkpoint "${FINAL_OUTPUT_DIR}" "${FINAL_STEP_CHECKPOINT}" "${FINAL_CHECKPOINT}")"
+  if [[ -z "${enhancement_resume_checkpoint}" && ! -f "${FINAL_REPORT}" && -n "${latest_enhancement_step}" ]]; then
+    enhancement_resume_checkpoint="${latest_enhancement_step}"
     stage_log "Resuming enhancement from step checkpoint: ${enhancement_resume_checkpoint}"
   fi
   if [[ -z "${enhancement_resume_checkpoint}" ]]; then
@@ -556,6 +595,7 @@ train_enhancement() {
     --split-seed "${SPLIT_SEED}"
     --log-every "${LOG_EVERY}"
     --step-checkpoint-every "${STEP_CHECKPOINT_EVERY}"
+    --checkpoint-keep-last "${CHECKPOINT_KEEP_LAST}"
     --output-dir "${FINAL_OUTPUT_DIR}"
     --report-path "${FINAL_REPORT}"
   )
@@ -580,8 +620,10 @@ train_transport() {
     return
   fi
   local transport_resume_checkpoint="${TRANSPORT_RESUME_CHECKPOINT}"
-  if [[ -z "${transport_resume_checkpoint}" && ! -f "${FINAL_REPORT}" && -f "${FINAL_STEP_CHECKPOINT}" ]]; then
-    transport_resume_checkpoint="${FINAL_STEP_CHECKPOINT}"
+  local latest_transport_step
+  latest_transport_step="$(latest_resume_checkpoint "${FINAL_OUTPUT_DIR}" "${FINAL_STEP_CHECKPOINT}" "${FINAL_CHECKPOINT}")"
+  if [[ -z "${transport_resume_checkpoint}" && ! -f "${FINAL_REPORT}" && -n "${latest_transport_step}" ]]; then
+    transport_resume_checkpoint="${latest_transport_step}"
     stage_log "Resuming transport training from step checkpoint: ${transport_resume_checkpoint}"
   elif [[ -z "${transport_resume_checkpoint}" && ! -f "${FINAL_REPORT}" && -f "${FINAL_CHECKPOINT}" ]]; then
     transport_resume_checkpoint="${FINAL_CHECKPOINT}"
@@ -603,6 +645,9 @@ train_transport() {
   fi
   if [[ "${MEDICAL_PROMPT_CONDITIONING}" == "1" ]]; then
     medical_transport_args+=(--medical-prompt-conditioning)
+  fi
+  if [[ "${STOCHASTIC_INITIAL_STATE}" == "1" ]]; then
+    medical_transport_args+=(--stochastic-initial-state)
   fi
 
   local transport_args=(
@@ -636,6 +681,7 @@ train_transport() {
     --role-hidden-channels "${ROLE_HIDDEN_CHANNELS}"
     --initial-residual-scale "${INITIAL_RESIDUAL_SCALE}"
     --medical-prompt-channels "${MEDICAL_PROMPT_CHANNELS}"
+    --stochastic-noise-scale "${STOCHASTIC_NOISE_SCALE}"
     --output-activation hardtanh
     --transport-steps "${TRANSPORT_STEPS}"
     --transport-step-scale "${TRANSPORT_STEP_SCALE}"
@@ -675,6 +721,7 @@ train_transport() {
     --split-seed "${SPLIT_SEED}"
     --log-every "${LOG_EVERY}"
     --step-checkpoint-every "${STEP_CHECKPOINT_EVERY}"
+    --checkpoint-keep-last "${CHECKPOINT_KEEP_LAST}"
     --output-dir "${FINAL_OUTPUT_DIR}"
     --report-path "${FINAL_REPORT}"
   )
@@ -734,8 +781,10 @@ train_transport_stage2_noharm() {
     return
   fi
   local stage2_resume_checkpoint="${STAGE2_RESUME_CHECKPOINT}"
-  if [[ -z "${stage2_resume_checkpoint}" && ! -f "${STAGE2_REPORT}" && -f "${STAGE2_STEP_CHECKPOINT}" ]]; then
-    stage2_resume_checkpoint="${STAGE2_STEP_CHECKPOINT}"
+  local latest_stage2_step
+  latest_stage2_step="$(latest_resume_checkpoint "${STAGE2_OUTPUT_DIR}" "${STAGE2_STEP_CHECKPOINT}" "${STAGE2_CHECKPOINT}")"
+  if [[ -z "${stage2_resume_checkpoint}" && ! -f "${STAGE2_REPORT}" && -n "${latest_stage2_step}" ]]; then
+    stage2_resume_checkpoint="${latest_stage2_step}"
     stage_log "Resuming stage-2 from step checkpoint: ${stage2_resume_checkpoint}"
   elif [[ -z "${stage2_resume_checkpoint}" && ! -f "${STAGE2_REPORT}" && -f "${STAGE2_CHECKPOINT}" ]]; then
     stage2_resume_checkpoint="${STAGE2_CHECKPOINT}"
@@ -759,6 +808,9 @@ train_transport_stage2_noharm() {
   fi
   if [[ "${MEDICAL_PROMPT_CONDITIONING}" == "1" ]]; then
     medical_transport_args+=(--medical-prompt-conditioning)
+  fi
+  if [[ "${STOCHASTIC_INITIAL_STATE}" == "1" ]]; then
+    medical_transport_args+=(--stochastic-initial-state)
   fi
   local stage2_extra_args=()
   if [[ "${STAGE2_GATED_REFINEMENT}" == "1" ]]; then
@@ -830,6 +882,7 @@ train_transport_stage2_noharm() {
       --role-hidden-channels "${ROLE_HIDDEN_CHANNELS}" \
       --initial-residual-scale "${INITIAL_RESIDUAL_SCALE}" \
       --medical-prompt-channels "${MEDICAL_PROMPT_CHANNELS}" \
+      --stochastic-noise-scale "${STOCHASTIC_NOISE_SCALE}" \
       "${stage2_extra_args[@]}" \
       --output-activation hardtanh \
       --transport-steps "${TRANSPORT_STEPS}" \
@@ -884,15 +937,19 @@ train_transport_stage2_noharm() {
       --split-seed "${SPLIT_SEED}" \
       --log-every "${LOG_EVERY}" \
       --step-checkpoint-every "${STEP_CHECKPOINT_EVERY}" \
+      --checkpoint-keep-last "${CHECKPOINT_KEEP_LAST}" \
       --output-dir "${STAGE2_OUTPUT_DIR}" \
       --report-path "${STAGE2_REPORT}" \
       --resume-checkpoint "${stage2_resume_checkpoint}"
 }
 
 visualize_cases() {
-  local vis_checkpoint="${STAGE2_BEST_CHECKPOINT}"
-  if [[ ! -f "${vis_checkpoint}" ]]; then
-    vis_checkpoint="${STAGE2_CHECKPOINT}"
+  local vis_checkpoint=""
+  if [[ "${TRAIN_STAGE2_HARD}" == "1" ]]; then
+    vis_checkpoint="${STAGE2_BEST_CHECKPOINT}"
+    if [[ ! -f "${vis_checkpoint}" ]]; then
+      vis_checkpoint="${STAGE2_CHECKPOINT}"
+    fi
   fi
   if [[ ! -f "${vis_checkpoint}" ]]; then
     vis_checkpoint="${FINAL_BEST_CHECKPOINT}"
@@ -921,10 +978,95 @@ visualize_cases() {
         --num-cases "${VIS_NUM_CASES}" \
         --case-selection "${selection}" \
         --selection-pool "${VIS_SELECTION_POOL}" \
+        --posterior-samples "${POSTERIOR_SAMPLES}" \
         --slice-crop-size "${VIS_SLICE_CROP_SIZE}" \
         --apply-brain-mask \
         --output-dir "${output_dir}"
   done
+}
+
+evaluate_full_volume() {
+  if [[ "${RUN_FULL_VOLUME_EVAL}" != "1" ]]; then
+    stage_log "RUN_FULL_VOLUME_EVAL=0; skipping full-volume validation."
+    return
+  fi
+  local eval_checkpoint="${FINAL_BEST_CHECKPOINT}"
+  if [[ "${TRAIN_STAGE2_HARD}" == "1" && -f "${STAGE2_BEST_CHECKPOINT}" ]]; then
+    eval_checkpoint="${STAGE2_BEST_CHECKPOINT}"
+  elif [[ "${TRAIN_STAGE2_HARD}" == "1" && -f "${STAGE2_CHECKPOINT}" ]]; then
+    eval_checkpoint="${STAGE2_CHECKPOINT}"
+  elif [[ ! -f "${eval_checkpoint}" ]]; then
+    eval_checkpoint="${FINAL_CHECKPOINT}"
+  fi
+  run_stage evaluate_full_volume \
+    python scripts/evaluate_slice_virtual_modality_full_volume.py \
+      --manifest "${MANIFEST}" \
+      --checkpoint "${eval_checkpoint}" \
+      --target-modality "${TARGET_MODALITY}" \
+      --device "${DEVICE}" \
+      --spatial-size "${SPATIAL_SIZE}" \
+      --max-subjects "${MAX_SUBJECTS}" \
+      --val-subjects "${VAL_SUBJECTS}" \
+      --split-seed "${SPLIT_SEED}" \
+      --batch-slices "${FULL_VOLUME_BATCH_SLICES}" \
+      --posterior-samples "${POSTERIOR_SAMPLES}" \
+      --report-path "${FULL_VOLUME_REPORT}"
+}
+
+evaluate_fusion() {
+  if [[ "${RUN_FUSION_EVAL}" != "1" ]]; then
+    stage_log "RUN_FUSION_EVAL=0; skipping downstream fusion validation."
+    return
+  fi
+  if [[ "${TARGET_MODALITY}" != "t1c" ]]; then
+    echo "[ERROR] Current fusion cache/evaluator supports target modality t1c only." >&2
+    exit 6
+  fi
+  if [[ -z "${FUSION_CHECKPOINT}" || ! -f "${FUSION_CHECKPOINT}" ]]; then
+    echo "[ERROR] RUN_FUSION_EVAL=1 requires an existing FUSION_CHECKPOINT." >&2
+    exit 6
+  fi
+  if [[ ! -f "${BRAINMVP_CHECKPOINT}" ]]; then
+    echo "[ERROR] BrainMVP checkpoint not found: ${BRAINMVP_CHECKPOINT}" >&2
+    exit 6
+  fi
+  local eval_checkpoint="${FINAL_BEST_CHECKPOINT}"
+  if [[ "${TRAIN_STAGE2_HARD}" == "1" && -f "${STAGE2_BEST_CHECKPOINT}" ]]; then
+    eval_checkpoint="${STAGE2_BEST_CHECKPOINT}"
+  elif [[ "${TRAIN_STAGE2_HARD}" == "1" && -f "${STAGE2_CHECKPOINT}" ]]; then
+    eval_checkpoint="${STAGE2_CHECKPOINT}"
+  elif [[ ! -f "${eval_checkpoint}" ]]; then
+    eval_checkpoint="${FINAL_CHECKPOINT}"
+  fi
+  run_stage precompute_fusion_cache \
+    python scripts/precompute_slice_virtual_t1c_cache.py \
+      --manifest "${MANIFEST}" \
+      --checkpoint "${eval_checkpoint}" \
+      --device "${DEVICE}" \
+      --spatial-size "${SPATIAL_SIZE}" \
+      --batch-slices "${FULL_VOLUME_BATCH_SLICES}" \
+      --posterior-samples "${POSTERIOR_SAMPLES}" \
+      --max-subjects "${MAX_SUBJECTS}" \
+      --val-subjects "${VAL_SUBJECTS}" \
+      --split-seed "${SPLIT_SEED}" \
+      --only-validation \
+      --skip-existing \
+      --apply-brain-mask \
+      --output-root "${FUSION_CACHE_ROOT}" \
+      --output-manifest "${FUSION_CACHE_MANIFEST}"
+  run_stage evaluate_fusion \
+    python scripts/evaluate_synthetic_modality_fusion.py \
+      --manifest "${MANIFEST}" \
+      --fusion-checkpoint "${FUSION_CHECKPOINT}" \
+      --brainmvp-checkpoint "${BRAINMVP_CHECKPOINT}" \
+      --synthetic-cache-manifest "${FUSION_CACHE_MANIFEST}" \
+      --target-modality "${TARGET_MODALITY}" \
+      --device "${DEVICE}" \
+      --spatial-size "${FUSION_SPATIAL_SIZE}" \
+      --max-subjects "${MAX_SUBJECTS}" \
+      --val-subjects "${VAL_SUBJECTS}" \
+      --split-seed "${SPLIT_SEED}" \
+      --report-path "${FUSION_REPORT}"
 }
 
 write_pipeline_report() {
@@ -932,7 +1074,8 @@ write_pipeline_report() {
     "${PIPELINE_REPORT}" "${ROOT}" "${DATA_ROOT}" "${RAW_ROOT}" "${MODEL_READY_ROOT}" \
     "${MANIFEST}" "${BASE_REPORT}" "${FINAL_REPORT}" "${STAGE2_REPORT}" "${VIS_DIR}" "${LOG_DIR}" \
     "${BASE_CHECKPOINT}" "${FINAL_CHECKPOINT}" "${FINAL_BEST_CHECKPOINT}" \
-    "${STAGE2_CHECKPOINT}" "${STAGE2_BEST_CHECKPOINT}" "${HARD_SLICE_JSON}" <<'PY'
+    "${STAGE2_CHECKPOINT}" "${STAGE2_BEST_CHECKPOINT}" "${HARD_SLICE_JSON}" \
+    "${FULL_VOLUME_REPORT}" "${FUSION_REPORT}" "${TRAIN_STAGE2_HARD}" <<'PY'
 import csv
 import json
 import os
@@ -959,7 +1102,11 @@ from pathlib import Path
     stage2_checkpoint,
     stage2_best_checkpoint,
     hard_slice_json,
+    full_volume_report,
+    fusion_report,
+    train_stage2_hard,
 ) = [Path(item) for item in sys.argv[1:]]
+train_stage2_enabled = str(train_stage2_hard) == "1"
 
 def count_rows(path: Path) -> int:
     if not path.exists() or path.stat().st_size == 0:
@@ -1014,10 +1161,16 @@ if visual_summary is None and vis_dir.exists():
         if child_summary is not None:
             visual_summaries[child.name] = child_summary
 hard_slices = load_json(hard_slice_json)
+full_volume = load_json(full_volume_report)
+fusion = load_json(fusion_report)
 
-selected_checkpoint = stage2_best_checkpoint if stage2_best_checkpoint.exists() else stage2_checkpoint
-if not selected_checkpoint.exists():
-    selected_checkpoint = final_best_checkpoint if final_best_checkpoint.exists() else final_checkpoint
+selected_checkpoint = final_best_checkpoint if final_best_checkpoint.exists() else final_checkpoint
+if train_stage2_enabled:
+    selected_checkpoint = (
+        stage2_best_checkpoint if stage2_best_checkpoint.exists() else stage2_checkpoint
+    )
+    if not selected_checkpoint.exists():
+        selected_checkpoint = final_best_checkpoint if final_best_checkpoint.exists() else final_checkpoint
 
 report = {
     "status": "H20_PIPELINE_DONE",
@@ -1036,6 +1189,9 @@ report = {
         "stage2_best_checkpoint": str(stage2_best_checkpoint),
         "selected_checkpoint": str(selected_checkpoint),
         "hard_slice_json": str(hard_slice_json),
+        "full_volume_report": str(full_volume_report),
+        "fusion_report": str(fusion_report),
+        "stage2_enabled": train_stage2_enabled,
         "base_report": str(base_report),
         "final_report": str(final_report),
         "stage2_report": str(stage2_report),
@@ -1055,6 +1211,8 @@ report = {
         "records": len((hard_slices or {}).get("records", [])) if isinstance(hard_slices, dict) else None,
         "summary": (hard_slices or {}).get("summary", {}) if isinstance(hard_slices, dict) else {},
     },
+    "full_volume_validation": full_volume,
+    "fusion_validation": fusion,
     "visual_summary": visual_summary,
     "visual_summaries": visual_summaries,
 }
@@ -1077,8 +1235,12 @@ main() {
     train_base_if_needed
   fi
   train_transport
-  mine_hard_slices
-  train_transport_stage2_noharm
+  if [[ "${TRAIN_STAGE2_HARD}" == "1" ]]; then
+    mine_hard_slices
+    train_transport_stage2_noharm
+  fi
+  evaluate_full_volume
+  evaluate_fusion
   visualize_cases
   write_pipeline_report
   stage_log "ALL DONE"

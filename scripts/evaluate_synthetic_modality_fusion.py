@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -77,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spatial-size", type=int, default=32)
     parser.add_argument("--max-subjects", type=int, default=72)
     parser.add_argument("--val-subjects", type=int, default=8)
+    parser.add_argument("--split-seed", type=int, default=4601)
     parser.add_argument("--foreground-crop-prob", type=float, default=0.0)
     parser.add_argument("--crop-mode", default="region_balanced")
     parser.add_argument(
@@ -211,8 +213,11 @@ def main() -> int:
         crop_mode=args.crop_mode,
         seed=46,
     )
-    val_count = min(args.val_subjects, max(1, len(dataset) // 4))
-    val_set = Subset(dataset, list(range(len(dataset)))[len(dataset) - val_count :])
+    val_count = min(max(1, args.val_subjects), max(1, len(dataset) // 4))
+    indices = list(range(len(dataset)))
+    random.Random(int(args.split_seed)).shuffle(indices)
+    val_indices = sorted(indices[:val_count])
+    val_set = Subset(dataset, val_indices)
     loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0)
 
     cases: dict[str, list[dict[str, float]]] = {

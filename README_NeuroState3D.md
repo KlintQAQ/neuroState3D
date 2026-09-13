@@ -350,3 +350,48 @@ composite score instead of whole-image MAE, so the selected model favors
 high-tumor, ET/TC, under-enhancement, structural fidelity, and no-harm behavior.
 It is the intended command when the goal is to push the current drifting method
 line as hard as the H20 job budget allows.
+
+## Reliable Target-Aware Training
+
+The current H200 entry point is:
+
+```bash
+DATA_ROOT=$HOME/NeuroState3D_data \
+RUN_NAME=h200_targetaware_t1c_seed46 \
+TARGET_MODALITY=t1c TRAIN_STAGE2_HARD=0 \
+RUN_FULL_VOLUME_EVAL=1 RUN_FUSION_EVAL=0 \
+bash scripts/run_h200_best_t1c_pipeline.sh
+```
+
+Training slices and crop locations now change deterministically with the epoch;
+the validation set remains fixed. Step checkpoints are versioned, retain the
+optimizer, RNG state, global step, within-epoch step, medical drift memory and
+best/history state, and the newest checkpoint is resumed automatically. Set
+`STEP_CHECKPOINT_EVERY=500` and `CHECKPOINT_KEEP_LAST=3` to control their
+frequency and retention.
+
+The one-stage model defaults to deterministic learned initialization. A
+stochastic conditional-initial-state experiment can be enabled separately:
+
+```bash
+STOCHASTIC_INITIAL_STATE=1 STOCHASTIC_NOISE_SCALE=0.05 POSTERIOR_SAMPLES=8 \
+RUN_NAME=h200_targetaware_t1c_stochastic_seed46 \
+bash scripts/run_h200_best_t1c_pipeline.sh
+```
+
+Patient-level whole-volume validation is enabled by default and is written to
+`reports/h200_pipeline/<run-name>_full_volume.json`. Downstream fusion
+evaluation is optional because it requires a separately trained fusion model
+using the same `SPLIT_SEED`:
+
+```bash
+RUN_FUSION_EVAL=1 \
+FUSION_CHECKPOINT=/path/to/evidence_fusion_small_last.pt \
+BRAINMVP_CHECKPOINT=/path/to/BrainMVP_uniformer.pt \
+bash scripts/run_h200_best_t1c_pipeline.sh
+```
+
+Use a distinct `RUN_NAME` for every target modality or ablation. Stage-2 hard
+slice refinement is retained for ablation (`TRAIN_STAGE2_HARD=1`) but is off by
+default; when it is off, neither hard-slice mining nor stale stage-2 checkpoint
+selection runs.

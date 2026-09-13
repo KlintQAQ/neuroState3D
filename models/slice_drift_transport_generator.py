@@ -34,6 +34,8 @@ class SliceDriftTransportGeneratorConfig:
     medical_role_conditioning: bool = False
     learned_initial_state: bool = False
     medical_prompt_conditioning: bool = False
+    stochastic_initial_state: bool = False
+    stochastic_noise_scale: float = 0.05
     role_hidden_channels: int = 0
     initial_residual_scale: float = 0.35
     prompt_channels: int = 5
@@ -86,6 +88,10 @@ class SliceDriftTransportGenerator(nn.Module):
             self.initial_residual_head = nn.Conv2d(hidden, 1, kernel_size=1)
             nn.init.zeros_(self.initial_residual_head.weight)
             nn.init.zeros_(self.initial_residual_head.bias)
+            if bool(self.config.stochastic_initial_state):
+                self.initial_noise_scale_head = nn.Conv2d(hidden, 1, kernel_size=1)
+                nn.init.zeros_(self.initial_noise_scale_head.weight)
+                nn.init.zeros_(self.initial_noise_scale_head.bias)
             if self.prompt_condition_channels > 0:
                 self.medical_prompt_head = nn.Sequential(
                     ConvNormAct2d(hidden, hidden),
@@ -171,6 +177,8 @@ class SliceDriftTransportGenerator(nn.Module):
         slices: torch.Tensor,
         modality_mask: torch.Tensor,
         class_condition: torch.Tensor | None = None,
+        stochastic: bool | None = None,
+        initial_noise: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if slices.ndim != 4:
             raise ValueError(f"Expected slices [B,M,H,W], got {tuple(slices.shape)}")
@@ -190,7 +198,14 @@ class SliceDriftTransportGenerator(nn.Module):
             mask_channels,
             class_map,
         )
-        current = self._initial_state(masked, modality_mask, role_context)
+        use_stochastic = self.training if stochastic is None else bool(stochastic)
+        current, initial_sigma = self._initial_state(
+            masked,
+            modality_mask,
+            role_context,
+            stochastic=use_stochastic,
+            initial_noise=initial_noise,
+        )
         states = [current]
         velocities = []
         uncertainty_raw = None
@@ -265,6 +280,7 @@ class SliceDriftTransportGenerator(nn.Module):
             "uncertainty": uncertainty,
             "confidence": confidence,
             "drift_initial": states[0],
+            "initial_sigma": initial_sigma,
             "stage1_synthetic": stage1,
             "drift_states": torch.stack(states, dim=1),
             "drift_velocities": torch.stack(velocities, dim=1),
@@ -331,7 +347,9 @@ class SliceDriftTransportGenerator(nn.Module):
         masked: torch.Tensor,
         modality_mask: torch.Tensor,
         role_context: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        stochastic: bool = False,
+        initial_noise: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         current = self._role_weighted_prior(masked, modality_mask)
         kernel = int(self.config.init_blur_kernel)
         if kernel > 1:
@@ -346,7 +364,23 @@ class SliceDriftTransportGenerator(nn.Module):
             current = current + float(self.config.initial_residual_scale) * torch.tanh(
                 self.initial_residual_head(role_context)
             )
-        return self._activate(current)
+        sigma = current.new_zeros(current.shape)
+        if bool(self.config.stochastic_initial_state):
+            base_scale = max(0.0, float(self.config.stochastic_noise_scale))
+            if role_context is not None and hasattr(self, "initial_noise_scale_head"):
+                sigma = base_scale * (
+                    0.1 + 0.9 * torch.sigmoid(self.initial_noise_scale_head(role_context))
+                )
+            else:
+                sigma = current.new_full(current.shape, base_scale)
+            if stochastic and base_scale > 0.0:
+                noise = torch.randn_like(current) if initial_noise is None else initial_noise
+                if tuple(noise.shape) != tuple(current.shape):
+                    raise ValueError(
+                        f"Expected initial_noise {tuple(current.shape)}, got {tuple(noise.shape)}"
+                    )
+                current = current + sigma * noise.to(current)
+        return self._activate(current), sigma
 
     def _velocity_step(
         self,

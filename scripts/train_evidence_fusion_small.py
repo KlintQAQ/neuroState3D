@@ -77,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spatial-size", type=int, default=48)
     parser.add_argument("--max-subjects", type=int, default=40)
     parser.add_argument("--val-subjects", type=int, default=8)
+    parser.add_argument("--split-seed", type=int, default=4601)
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--max-train-steps", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -1401,8 +1402,9 @@ def main() -> int:
     if train_count <= 0:
         raise ValueError("Need at least one training subject after val split.")
     indices = list(range(len(dataset)))
-    train_indices = indices[:train_count]
-    val_indices = indices[train_count:]
+    random.Random(int(args.split_seed)).shuffle(indices)
+    val_indices = sorted(indices[:val_count])
+    train_indices = sorted(indices[val_count:])
     train_set = Subset(dataset, train_indices)
     val_set = Subset(dataset, val_indices)
     train_loader = DataLoader(

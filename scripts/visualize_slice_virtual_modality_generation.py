@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--selection-pool", type=int, default=120)
     parser.add_argument("--batch-slices", type=int, default=16)
+    parser.add_argument("--posterior-samples", type=int, default=1)
     parser.add_argument("--slice-crop-size", type=int, default=0)
     parser.add_argument("--apply-brain-mask", action="store_true")
     parser.add_argument("--support-threshold", type=float, default=1e-5)
@@ -116,6 +117,8 @@ def load_model(
         model = SliceDriftTransportGenerator(
             SliceDriftTransportGeneratorConfig(
                 in_modalities=in_modalities,
+                base_modalities=len(BRATS_MODALITIES),
+                target_base_index=BRATS_MODALITIES.index(target),
                 hidden_channels=int(config.get("hidden_channels", 32)),
                 transport_steps=int(config.get("transport_steps", 4)),
                 transport_step_scale=float(config.get("transport_step_scale", 1.0)),
@@ -124,6 +127,14 @@ def load_model(
                 class_channels=len(BRATS_DATASETS),
                 class_conditioned=bool(config.get("class_conditioned", False)),
                 output_activation=str(config.get("output_activation", "hardtanh")),
+                medical_role_conditioning=bool(config.get("medical_role_conditioning", False)),
+                learned_initial_state=bool(config.get("learned_initial_state", False)),
+                medical_prompt_conditioning=bool(config.get("medical_prompt_conditioning", False)),
+                stochastic_initial_state=bool(config.get("stochastic_initial_state", False)),
+                stochastic_noise_scale=float(config.get("stochastic_noise_scale", 0.05)),
+                role_hidden_channels=int(config.get("role_hidden_channels", 0)),
+                initial_residual_scale=float(config.get("initial_residual_scale", 0.35)),
+                prompt_channels=int(config.get("medical_prompt_channels", 5)),
                 gated_refinement=bool(config.get("gated_refinement", False)),
                 refinement_residual_scale=float(config.get("refinement_residual_scale", 0.25)),
                 gate_bias_init=float(config.get("gate_bias_init", -3.0)),
@@ -233,6 +244,7 @@ def generate_volume(
     target_index: int,
     batch_slices: int,
     dataset_name: str = "",
+    posterior_samples: int = 1,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -268,7 +280,26 @@ def generate_volume(
             if class_condition is not None
             else None
         )
-        output = model(slices, batch_mask, batch_class)
+        sample_count = max(1, int(posterior_samples))
+        outputs = []
+        for _ in range(sample_count):
+            if isinstance(model, SliceDriftTransportGenerator) and sample_count > 1:
+                outputs.append(model(slices, batch_mask, batch_class, stochastic=True))
+            else:
+                outputs.append(model(slices, batch_mask, batch_class))
+        output = outputs[0]
+        if sample_count > 1:
+            synthetic_stack = torch.stack([item["synthetic"] for item in outputs], dim=0)
+            aleatoric = torch.stack(
+                [item["uncertainty"] for item in outputs], dim=0
+            ).mean(dim=0)
+            posterior_std = synthetic_stack.std(dim=0, unbiased=False)
+            output = dict(output)
+            output["synthetic"] = synthetic_stack.mean(dim=0)
+            output["uncertainty"] = (
+                aleatoric.square() + posterior_std.square()
+            ).sqrt()
+            output["confidence"] = torch.exp(-output["uncertainty"])
         synthetic_slices.append(output["synthetic"].squeeze(1).cpu())
         confidence_slices.append(output["confidence"].squeeze(1).cpu())
         uncertainty_slices.append(output["uncertainty"].squeeze(1).cpu())
@@ -612,6 +643,7 @@ def main() -> int:
                 target_index,
                 int(args.batch_slices),
                 row["dataset"],
+                posterior_samples=args.posterior_samples,
             )
             if args.apply_brain_mask:
                 support = observed_brain_support_np(

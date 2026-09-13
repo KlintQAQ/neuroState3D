@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+
+import numpy as np
 import torch
 
 from models.slice_drift_transport_generator import (
@@ -7,6 +10,7 @@ from models.slice_drift_transport_generator import (
     SliceDriftTransportGeneratorConfig,
 )
 from scripts.train_slice_virtual_modality_drifting import (
+    BraTSSliceDataset,
     selection_score,
     transport_path_loss,
     transport_velocity_loss,
@@ -121,6 +125,75 @@ def test_transport_losses_backpropagate_to_velocity_head() -> None:
     assert grad is not None
     assert torch.isfinite(grad).all()
     assert grad.abs().sum() > 0
+
+
+def test_stochastic_initial_state_is_controllable_and_eval_is_deterministic() -> None:
+    model = SliceDriftTransportGenerator(
+        SliceDriftTransportGeneratorConfig(
+            in_modalities=4,
+            hidden_channels=8,
+            transport_steps=2,
+            medical_role_conditioning=True,
+            learned_initial_state=True,
+            stochastic_initial_state=True,
+            stochastic_noise_scale=0.1,
+        )
+    )
+    image = torch.randn(1, 4, 16, 16)
+    mask = torch.tensor([[1.0, 0.0, 1.0, 1.0]])
+
+    model.eval()
+    deterministic_a = model(image, mask)
+    deterministic_b = model(image, mask)
+    assert torch.equal(deterministic_a["synthetic"], deterministic_b["synthetic"])
+    assert deterministic_a["initial_sigma"].min() > 0
+
+    noise_a = torch.zeros(1, 1, 16, 16)
+    noise_b = torch.ones(1, 1, 16, 16)
+    stochastic_a = model(image, mask, stochastic=True, initial_noise=noise_a)
+    stochastic_b = model(image, mask, stochastic=True, initial_noise=noise_b)
+    assert not torch.equal(stochastic_a["drift_initial"], stochastic_b["drift_initial"])
+
+
+def test_training_slice_sampling_changes_by_epoch_but_is_reproducible(tmp_path) -> None:
+    image_path = tmp_path / "image.npy"
+    seg_path = tmp_path / "seg.npy"
+    manifest_path = tmp_path / "manifest.csv"
+    np.save(image_path, np.zeros((4, 8, 8, 8), dtype=np.float32))
+    seg = np.zeros((8, 8, 8), dtype=np.int64)
+    seg[3, 3, :] = 1
+    np.save(seg_path, seg)
+    with manifest_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=("dataset", "subject_id", "multimodal_path", "seg_path"),
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "dataset": "GLI",
+                "subject_id": "subject-1",
+                "multimodal_path": str(image_path),
+                "seg_path": str(seg_path),
+            }
+        )
+    dataset = BraTSSliceDataset(
+        manifest_path,
+        spatial_size=8,
+        max_subjects=None,
+        slices_per_subject=16,
+        target_modality="t1c",
+        seed=46,
+    )
+
+    epoch_zero = [dataset[index]["slice_index"] for index in range(len(dataset))]
+    dataset.set_epoch(1)
+    epoch_one = [dataset[index]["slice_index"] for index in range(len(dataset))]
+    dataset.set_epoch(0)
+    epoch_zero_repeat = [dataset[index]["slice_index"] for index in range(len(dataset))]
+
+    assert epoch_zero != epoch_one
+    assert epoch_zero == epoch_zero_repeat
 
 
 def test_context_slice_batch_matches_expected_channel_order() -> None:

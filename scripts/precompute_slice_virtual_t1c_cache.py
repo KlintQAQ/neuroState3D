@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -20,6 +21,10 @@ from datasets.brats_fusion_dataset import BRATS_MODALITIES  # noqa: E402
 from models.slice_virtual_modality_generator import (  # noqa: E402
     SliceVirtualModalityGenerator,
     SliceVirtualModalityGeneratorConfig,
+)
+from scripts.visualize_slice_virtual_modality_generation import (  # noqa: E402
+    generate_volume,
+    load_model as load_slice_model,
 )
 
 
@@ -41,7 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--spatial-size", type=int, default=32)
     parser.add_argument("--batch-slices", type=int, default=32)
+    parser.add_argument("--posterior-samples", type=int, default=1)
     parser.add_argument("--max-subjects", type=int, default=0)
+    parser.add_argument("--val-subjects", type=int, default=0)
+    parser.add_argument("--split-seed", type=int, default=4601)
+    parser.add_argument("--only-validation", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--apply-brain-mask", action="store_true")
     parser.add_argument("--support-threshold", type=float, default=1e-5)
@@ -67,20 +76,6 @@ def parse_args() -> argparse.Namespace:
 def read_rows(path: str | Path) -> list[dict[str, str]]:
     with Path(path).open("r", newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
-
-
-def load_model(path: str, device: str) -> tuple[SliceVirtualModalityGenerator, str]:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    config = payload.get("config", {})
-    model = SliceVirtualModalityGenerator(
-        SliceVirtualModalityGeneratorConfig(
-            in_modalities=len(BRATS_MODALITIES),
-            hidden_channels=int(config.get("hidden_channels", 32)),
-        )
-    )
-    model.load_state_dict(payload["model"], strict=True)
-    model.to(device).eval()
-    return model, str(payload.get("target_modality", config.get("target_modality", "t1c")))
 
 
 def resize_volume(image: torch.Tensor, spatial_size: int) -> torch.Tensor:
@@ -123,12 +118,20 @@ def main() -> int:
     args = parse_args()
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
-    model, target = load_model(args.checkpoint, args.device)
+    model, target = load_slice_model(args.checkpoint, args.device, "")
     if target != "t1c":
         raise ValueError(f"Expected T1c generator, got {target}")
     rows = read_rows(args.manifest)
     if args.max_subjects > 0:
         rows = rows[: int(args.max_subjects)]
+    if args.only_validation:
+        shuffled = list(rows)
+        random.Random(int(args.split_seed)).shuffle(shuffled)
+        val_count = min(
+            max(1, int(args.val_subjects)),
+            max(1, len(shuffled) // 4),
+        )
+        rows = shuffled[:val_count]
     output_root = Path(args.output_root)
     manifest_rows = []
     started = time.perf_counter()
@@ -154,28 +157,14 @@ def main() -> int:
             image_np = np.load(row["multimodal_path"]).astype(np.float32, copy=False)
             image = torch.from_numpy(image_np).to(args.device)
             image = resize_volume(image, int(args.spatial_size))
-            _, d, h, w = image.shape
-            mask = torch.ones(1, len(BRATS_MODALITIES), device=args.device)
-            mask[:, target_index] = 0.0
-            synthetic_slices = []
-            uncertainty_slices = []
-            confidence_slices = []
-            # Match training: slice = image[:, :, :, z] from [M, D, H, W].
-            for start in range(0, w, int(args.batch_slices)):
-                end = min(start + int(args.batch_slices), w)
-                slices = image[:, :, :, start:end].permute(3, 0, 1, 2).contiguous()
-                batch_mask = mask.expand(slices.shape[0], -1)
-                generated = model(slices, batch_mask)
-                synthetic_slices.append(generated["synthetic"].squeeze(1).detach().cpu())
-                uncertainty_slices.append(generated["uncertainty"].squeeze(1).detach().cpu())
-                confidence_slices.append(generated["confidence"].squeeze(1).detach().cpu())
-            synthetic = torch.cat(synthetic_slices, dim=0).numpy()
-            uncertainty = torch.cat(uncertainty_slices, dim=0).numpy()
-            confidence = torch.cat(confidence_slices, dim=0).numpy()
-            # Return to [D, H, W], matching the model-ready/cache convention.
-            synthetic = np.transpose(synthetic, (1, 2, 0))
-            uncertainty = np.transpose(uncertainty, (1, 2, 0))
-            confidence = np.transpose(confidence, (1, 2, 0))
+            synthetic, confidence, uncertainty, _, _, _, _ = generate_volume(
+                model,
+                image,
+                target_index,
+                int(args.batch_slices),
+                str(row.get("dataset", "")),
+                posterior_samples=int(args.posterior_samples),
+            )
             if args.apply_brain_mask:
                 support = observed_brain_support(
                     image,
