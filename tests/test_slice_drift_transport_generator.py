@@ -11,6 +11,7 @@ from models.slice_drift_transport_generator import (
 )
 from scripts.train_slice_virtual_modality_drifting import (
     BraTSSliceDataset,
+    MedicalDriftBank2D,
     selection_score,
     transport_path_loss,
     transport_velocity_loss,
@@ -194,6 +195,47 @@ def test_training_slice_sampling_changes_by_epoch_but_is_reproducible(tmp_path) 
 
     assert epoch_zero != epoch_one
     assert epoch_zero == epoch_zero_repeat
+
+
+def test_medical_bank_batches_hierarchical_updates_without_changing_fifo_contents() -> None:
+    bank = MedicalDriftBank2D(max_tokens=100, max_add_tokens=100, memory_tokens=3)
+    tokens = torch.arange(2 * 5 * 3, dtype=torch.float32).view(2, 5, 3)
+    batch = {
+        "dataset": ["GLI", "MEN"],
+        "dataset_id": torch.tensor([0, 1]),
+        "region_bin": torch.tensor([3, 2]),
+        "lesion_area_bin": torch.tensor([1, 2]),
+        "enhancement_bin": torch.tensor([2, 1]),
+        "z_bin": torch.tensor([1, 4]),
+    }
+
+    suffixes = bank.batch_condition_suffixes(batch, batch_size=2)
+    descriptors = {"energy": tokens}
+    bank.update(
+        "t1c",
+        descriptors,
+        {"energy": tokens + 100.0},
+        batch,
+        suffixes,
+    )
+
+    expected_positive = tokens.flatten(0, 1)
+    assert torch.equal(bank.positive._storage["t1c:energy"], expected_positive)
+    assert torch.equal(bank.positive._storage["t1c:energy:global"], expected_positive)
+    assert bank.positive.count("t1c:energy:ds=GLI:r=ET:z=1:e=high:a=small") == 5
+    assert bank.positive.count("t1c:energy:ds=MEN:r=TC:z=4:e=mid:a=medium") == 5
+
+    sampled = bank.sample_positive(
+        "t1c",
+        "energy",
+        batch_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        batch=batch,
+        condition_suffixes=suffixes,
+    )
+    assert sampled is not None
+    assert sampled.shape == (2, 3, 3)
 
 
 def test_context_slice_batch_matches_expected_channel_order() -> None:

@@ -2192,6 +2192,59 @@ class _TokenStore:
         for key in keys:
             self.add(key, tokens)
 
+    def add_conditioned(
+        self,
+        key_options: Sequence[Sequence[str]],
+        tokens: torch.Tensor,
+    ) -> None:
+        """Add one batch to hierarchical keys with a single device transfer.
+
+        The former implementation called ``add`` once per sample and per key.
+        For target-aware training that meant thousands of tiny CUDA-to-CPU
+        transfers and repeatedly copying every full token buffer in one batch.
+        Grouping the rows first preserves the same bounded FIFO semantics while
+        reducing the transfer to once per descriptor and the buffer copy to
+        once per unique key.
+        """
+        if self.max_tokens <= 0:
+            return
+        if int(tokens.shape[0]) != len(key_options):
+            raise ValueError(
+                f"Expected {tokens.shape[0]} key rows, got {len(key_options)}"
+            )
+
+        # Moving the full descriptor batch once is crucial: calling .cpu() in
+        # the nested sample/key loop serializes CUDA execution on every call.
+        cpu_tokens = tokens.detach().float().cpu()
+        grouped: dict[str, list[torch.Tensor]] = {}
+        for index, options in enumerate(key_options):
+            row = cpu_tokens[index].reshape(-1, cpu_tokens.shape[-1])
+            row = row[torch.isfinite(row).all(dim=1)]
+            if row.numel() == 0:
+                continue
+            if row.shape[0] > self.max_add_tokens:
+                choice = torch.randperm(row.shape[0])[: self.max_add_tokens]
+                row = row[choice]
+            for key in options:
+                grouped.setdefault(str(key), []).append(row)
+
+        for key, rows in grouped.items():
+            added = rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
+            if added.shape[0] >= self.max_tokens:
+                # Clone so a short retained tail does not keep a much larger
+                # temporary concatenation alive.
+                self._storage[key] = added[-self.max_tokens :].clone()
+                continue
+            previous = self._storage.get(key)
+            if previous is None or previous.numel() == 0:
+                self._storage[key] = added
+                continue
+            keep_previous = self.max_tokens - int(added.shape[0])
+            self._storage[key] = torch.cat(
+                [previous[-keep_previous:], added],
+                dim=0,
+            )
+
     def sample(
         self,
         key: str,
@@ -2381,11 +2434,96 @@ class MedicalDriftBank2D:
         feature_name: str,
         batch_size: int,
         batch: dict[str, Any] | None,
+        condition_suffixes: Sequence[Sequence[str]] | None = None,
     ) -> list[list[str]]:
+        if condition_suffixes is not None:
+            prefix = self._key(target_modality, feature_name)
+            return [
+                [prefix + suffix for suffix in suffixes]
+                for suffixes in condition_suffixes
+            ]
         return [
             self._condition_keys(target_modality, feature_name, batch, index)
             for index in range(batch_size)
         ]
+
+    @staticmethod
+    def _batch_condition_values(
+        batch: dict[str, Any] | None,
+        key: str,
+        batch_size: int,
+        default: int,
+    ) -> list[int]:
+        if batch is None or key not in batch:
+            return [int(default)] * batch_size
+        value = batch[key]
+        if torch.is_tensor(value):
+            # One synchronization per metadata field instead of one per
+            # sample, descriptor, bank sign, and hierarchy level.
+            raw = value.detach().cpu().flatten().tolist()
+        elif isinstance(value, (list, tuple)):
+            raw = list(value)
+        else:
+            raw = [value]
+        result: list[int] = []
+        for index in range(batch_size):
+            try:
+                result.append(int(raw[index]))
+            except (TypeError, ValueError, IndexError):
+                result.append(int(default))
+        return result
+
+    def batch_condition_suffixes(
+        self,
+        batch: dict[str, Any] | None,
+        batch_size: int,
+    ) -> list[list[str]]:
+        """Build feature-independent hierarchy suffixes once per batch."""
+        if batch is None:
+            return [[":global", ""] for _ in range(batch_size)]
+
+        datasets = batch.get("dataset")
+        dataset_ids = self._batch_condition_values(batch, "dataset_id", batch_size, -1)
+        regions = self._batch_condition_values(batch, "region_bin", batch_size, 0)
+        areas = self._batch_condition_values(batch, "lesion_area_bin", batch_size, 0)
+        enhancements = self._batch_condition_values(batch, "enhancement_bin", batch_size, 0)
+        z_bins = self._batch_condition_values(
+            batch,
+            "z_bin",
+            batch_size,
+            BRATS_Z_BINS // 2,
+        )
+
+        suffixes: list[list[str]] = []
+        for index in range(batch_size):
+            dataset = "ALL"
+            if isinstance(datasets, (list, tuple)) and index < len(datasets):
+                candidate = str(datasets[index]).upper()
+                if candidate in BRATS_DATASETS:
+                    dataset = candidate
+            elif 0 <= dataset_ids[index] < len(BRATS_DATASETS):
+                dataset = BRATS_DATASETS[dataset_ids[index]]
+            region = self._name_from_index(BRATS_REGION_BINS, regions[index], "BG")
+            area = self._name_from_index(BRATS_AREA_BINS, areas[index], "none")
+            enhancement = self._name_from_index(
+                BRATS_ENHANCEMENT_BINS,
+                enhancements[index],
+                "low",
+            )
+            z_bin = max(0, min(BRATS_Z_BINS - 1, z_bins[index]))
+            suffixes.append(
+                [
+                    f":ds={dataset}:r={region}:z={z_bin}:e={enhancement}:a={area}",
+                    f":ds={dataset}:r={region}:z={z_bin}:e={enhancement}",
+                    f":ds={dataset}:r={region}:e={enhancement}",
+                    f":ds={dataset}:r={region}",
+                    f":r={region}:e={enhancement}",
+                    f":ds={dataset}",
+                    ":global",
+                    "",
+                ]
+            )
+        return suffixes
 
     def sample_positive(
         self,
@@ -2395,10 +2533,17 @@ class MedicalDriftBank2D:
         device: torch.device,
         dtype: torch.dtype,
         batch: dict[str, Any] | None = None,
+        condition_suffixes: Sequence[Sequence[str]] | None = None,
     ) -> torch.Tensor | None:
-        if batch is not None:
+        if batch is not None or condition_suffixes is not None:
             return self.positive.sample_many(
-                self._batch_key_options(target_modality, feature_name, batch_size, batch),
+                self._batch_key_options(
+                    target_modality,
+                    feature_name,
+                    batch_size,
+                    batch,
+                    condition_suffixes,
+                ),
                 self.memory_tokens,
                 device,
                 dtype,
@@ -2419,10 +2564,17 @@ class MedicalDriftBank2D:
         device: torch.device,
         dtype: torch.dtype,
         batch: dict[str, Any] | None = None,
+        condition_suffixes: Sequence[Sequence[str]] | None = None,
     ) -> torch.Tensor | None:
-        if batch is not None:
+        if batch is not None or condition_suffixes is not None:
             return self.negative.sample_many(
-                self._batch_key_options(target_modality, feature_name, batch_size, batch),
+                self._batch_key_options(
+                    target_modality,
+                    feature_name,
+                    batch_size,
+                    batch,
+                    condition_suffixes,
+                ),
                 self.memory_tokens,
                 device,
                 dtype,
@@ -2441,31 +2593,44 @@ class MedicalDriftBank2D:
         positive_descriptors: dict[str, torch.Tensor],
         negative_descriptors: dict[str, torch.Tensor],
         batch: dict[str, Any] | None = None,
+        condition_suffixes: Sequence[Sequence[str]] | None = None,
     ) -> None:
         for name, tokens in positive_descriptors.items():
-            if batch is None:
+            if batch is None and condition_suffixes is None:
                 self.positive.add_many(
-                    [f"{self._key(target_modality, name)}:global", self._key(target_modality, name)],
+                    [
+                        f"{self._key(target_modality, name)}:global",
+                        self._key(target_modality, name),
+                    ],
                     tokens,
                 )
-            else:
-                for index in range(tokens.shape[0]):
-                    self.positive.add_many(
-                        self._condition_keys(target_modality, name, batch, index),
-                        tokens[index : index + 1],
-                    )
+                continue
+            options = self._batch_key_options(
+                target_modality,
+                name,
+                int(tokens.shape[0]),
+                batch,
+                condition_suffixes,
+            )
+            self.positive.add_conditioned(options, tokens)
         for name, tokens in negative_descriptors.items():
-            if batch is None:
+            if batch is None and condition_suffixes is None:
                 self.negative.add_many(
-                    [f"{self._key(target_modality, name)}:global", self._key(target_modality, name)],
+                    [
+                        f"{self._key(target_modality, name)}:global",
+                        self._key(target_modality, name),
+                    ],
                     tokens,
                 )
-            else:
-                for index in range(tokens.shape[0]):
-                    self.negative.add_many(
-                        self._condition_keys(target_modality, name, batch, index),
-                        tokens[index : index + 1],
-                    )
+                continue
+            options = self._batch_key_options(
+                target_modality,
+                name,
+                int(tokens.shape[0]),
+                batch,
+                condition_suffixes,
+            )
+            self.negative.add_conditioned(options, tokens)
 
     def counts(self, target_modality: str, feature_names: Sequence[str]) -> dict[str, int]:
         return {
@@ -2523,6 +2688,7 @@ def medical_multilevel_drift_loss(
     losses = []
     report: dict[str, float] = {}
     feature_names = list(generated_desc)
+    condition_suffixes = bank.batch_condition_suffixes(batch, int(synthetic.shape[0]))
     for name in feature_names:
         generated_tokens, positive_tokens, generated_weight = subsample_pair_tokens_by_weight(
             generated_desc[name],
@@ -2538,6 +2704,7 @@ def medical_multilevel_drift_loss(
             generated_tokens.device,
             generated_tokens.dtype,
             batch,
+            condition_suffixes,
         )
         negative_memory = bank.sample_negative(
             target_modality,
@@ -2546,6 +2713,7 @@ def medical_multilevel_drift_loss(
             generated_tokens.device,
             generated_tokens.dtype,
             batch,
+            condition_suffixes,
         )
 
         positive_all = (
@@ -2598,7 +2766,13 @@ def medical_multilevel_drift_loss(
         report[f"medical_drift_{name}"] = float(loss.detach().cpu().item())
         report[f"medical_drift_{name}_weight"] = float(descriptor_weight)
 
-    bank.update(target_modality, positive_desc, generated_desc, batch)
+    bank.update(
+        target_modality,
+        positive_desc,
+        generated_desc,
+        batch,
+        condition_suffixes,
+    )
     report.update(bank.counts(target_modality, feature_names))
     if not losses:
         return synthetic.new_zeros(()), report
