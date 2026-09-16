@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import cProfile
+import itertools
 import csv
 import json
 import math
@@ -13,7 +15,7 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, Subset
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -235,6 +237,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-steps", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--cpu-threads", type=int, default=4,
+                        help="CPU intra-op threads; keep below the container CPU quota.")
+    parser.add_argument("--profile-steps", type=int, default=0,
+                        help="Synchronously time the first N executed steps of each epoch.")
     parser.add_argument("--model-kind", default="slice", choices=("slice", "prompted", "transport"))
     parser.add_argument(
         "--best-metric",
@@ -422,6 +428,8 @@ def exact_resume_config_mismatches(
         "device",
         "epochs",
         "num_workers",
+        "cpu_threads",
+        "profile_steps",
         "log_every",
         "step_checkpoint_every",
         "checkpoint_keep_last",
@@ -3640,6 +3648,22 @@ def save_step_checkpoint(
     return checkpoint_path
 
 
+class ResumableBatchSampler(BatchSampler):
+    """Skip completed index batches without loading their volumes again.
+
+    The underlying sampler still consumes the same RNG sequence. BraTSSliceDataset
+    derives augmentation randomness from epoch and sample index, not worker RNG.
+    """
+
+    start_batch = 0
+
+    def __iter__(self):
+        return itertools.islice(super().__iter__(), self.start_batch, None)
+
+    def __len__(self):
+        return max(0, super().__len__() - self.start_batch)
+
+
 def train_one_epoch(
     model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
     loader: DataLoader,
@@ -3657,20 +3681,52 @@ def train_one_epoch(
     started = time.perf_counter()
     last_log = started
     step_checkpoint_every = int(max(0, getattr(args, "step_checkpoint_every", 0)))
-    for step, batch in enumerate(loader):
+    profile_steps = max(0, int(getattr(args, "profile_steps", 0)))
+    completed_steps = 0
+    step_offset = 0
+    if isinstance(loader.batch_sampler, ResumableBatchSampler):
+        loader.batch_sampler.start_batch = max(0, int(start_step))
+        step_offset = loader.batch_sampler.start_batch
+    batch_ready_since = time.perf_counter()
+    for step, batch in enumerate(loader, start=step_offset):
         if args.max_train_steps > 0 and step >= args.max_train_steps:
             break
         step_in_epoch = step + 1
         if step_in_epoch <= int(start_step):
+            batch_ready_since = time.perf_counter()
             continue
+        profiling = completed_steps < profile_steps
+        timings: dict[str, float] = {}
+        profiler = cProfile.Profile() if profiling else None
+        if profiling:
+            timings["data_wait_sec"] = time.perf_counter() - batch_ready_since
+            if str(device).startswith("cuda"):
+                torch.cuda.synchronize(device)
+            stage_started = time.perf_counter()
+            profiler.enable()
+
+        def finish_stage(name: str) -> None:
+            nonlocal stage_started
+            if profiling:
+                if str(device).startswith("cuda"):
+                    torch.cuda.synchronize(device)
+                now = time.perf_counter()
+                timings[name] = now - stage_started
+                stage_started = now
+
         batch = to_device(batch, device)
+        finish_stage("to_device_sec")
         loss, parts = loss_for_batch(model, batch, args, medical_bank)
+        finish_stage("forward_and_loss_sec")
         if not torch.isfinite(loss).item():
             raise RuntimeError(f"Non-finite loss at step {step}: {parts}")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        finish_stage("backward_sec")
         nonfinite_grad_values = sanitize_gradients(model)
+        finish_stage("sanitize_gradients_sec")
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(model), 1.0)
+        finish_stage("clip_gradients_sec")
         if not torch.isfinite(grad_norm).item():
             optimizer.zero_grad(set_to_none=True)
             parts["grad_norm"] = float("nan")
@@ -3678,9 +3734,23 @@ def train_one_epoch(
             parts["nonfinite_grad_values"] = nonfinite_grad_values
             parts["step_checkpoint_written"] = False
             losses.append(parts)
+            if profiler is not None:
+                profiler.disable()
+            completed_steps += 1
+            batch_ready_since = time.perf_counter()
             continue
         optimizer.step()
+        finish_stage("optimizer_sec")
         global_step += 1
+        if profiler is not None:
+            profiler.disable()
+            profile_path = Path(args.output_dir) / f"profile_step_{global_step:09d}.prof"
+            profile_path.parent.mkdir(parents=True, exist_ok=True)
+            profiler.dump_stats(str(profile_path))
+            print(json.dumps({"event": "step_profile", "epoch": epoch,
+                              "global_step": global_step, **timings,
+                              "profile_path": str(profile_path)}), flush=True)
+        completed_steps += 1
         parts["grad_norm"] = float(grad_norm.detach().cpu().item())
         parts["skipped_nonfinite_grad"] = False
         parts["nonfinite_grad_values"] = nonfinite_grad_values
@@ -3727,6 +3797,7 @@ def train_one_epoch(
                 flush=True,
             )
             last_log = now
+        batch_ready_since = time.perf_counter()
     keys = [key for key in losses[0] if key != "grad_norm"] if losses else []
     return {
         "epoch": epoch,
@@ -4094,12 +4165,20 @@ def reset_lesion_residual_head(
 
 
 def sanitize_gradients(model: torch.nn.Module) -> int:
-    replaced = 0
+    gradients = []
+    bad_counts = []
     for parameter in trainable_parameters(model):
         if parameter.grad is None:
             continue
         finite = torch.isfinite(parameter.grad)
-        bad = int((~finite).sum().detach().cpu().item())
+        gradients.append(parameter)
+        bad_counts.append((~finite).sum())
+    if not bad_counts:
+        return 0
+    # Transfer all counts together, rather than synchronizing once per parameter.
+    counts = torch.stack(bad_counts).detach().cpu().tolist()
+    replaced = 0
+    for parameter, bad in zip(gradients, counts):
         if bad:
             parameter.grad = torch.nan_to_num(parameter.grad, nan=0.0, posinf=0.0, neginf=0.0)
             replaced += bad
@@ -4116,6 +4195,12 @@ def optimizer_to_device(optimizer: torch.optim.Optimizer, device: str) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.cpu_threads < 1:
+        raise ValueError("--cpu-threads must be positive")
+    torch.set_num_threads(args.cpu_threads)
+    torch.set_num_interop_threads(1)
+    print(json.dumps({"event": "cpu_thread_config", "intraop_threads": torch.get_num_threads(),
+                      "interop_threads": torch.get_num_interop_threads()}), flush=True)
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
     set_seed(args.seed)
@@ -4180,8 +4265,11 @@ def main() -> int:
     train_shuffle_generator = torch.Generator()
     train_loader = DataLoader(
         train_set,
-        batch_size=args.batch_size,
-        shuffle=True,
+        batch_sampler=ResumableBatchSampler(
+            RandomSampler(train_set, generator=train_shuffle_generator),
+            batch_size=args.batch_size,
+            drop_last=False,
+        ),
         num_workers=args.num_workers,
         generator=train_shuffle_generator,
     )
