@@ -35,6 +35,10 @@ from models.slice_drift_transport_generator import (  # noqa: E402
     SliceDriftTransportGenerator,
     SliceDriftTransportGeneratorConfig,
 )
+from models.closed_loop_drift_generator import (  # noqa: E402
+    closed_loop_parameter_report,
+    closed_loop_trainable_prefixes,
+)
 from scripts.smoke_evidence_fusion_brats import environment, git_commit  # noqa: E402
 from utils.brats_metrics import dice_scores, segmentation_loss  # noqa: E402
 from utils.torch_drift_loss import drift_loss  # noqa: E402
@@ -267,6 +271,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--role-hidden-channels", type=int, default=0)
     parser.add_argument("--initial-residual-scale", type=float, default=0.35)
     parser.add_argument("--medical-prompt-channels", type=int, default=5)
+    parser.add_argument(
+        "--closed-loop-token-drift",
+        action="store_true",
+        help="Add downstream-feedback token attention as a residual drift velocity adapter.",
+    )
+    parser.add_argument("--closed-loop-feedback-channels", type=int, default=32)
+    parser.add_argument("--closed-loop-token-channels", type=int, default=64)
+    parser.add_argument("--closed-loop-token-heads", type=int, default=4)
+    parser.add_argument("--closed-loop-token-stride", type=int, default=4)
+    parser.add_argument("--closed-loop-adapter-scale", type=float, default=0.12)
+    parser.add_argument("--closed-loop-gate-bias-init", type=float, default=-3.0)
+    parser.add_argument("--closed-loop-detach-feedback", action="store_true")
     parser.add_argument("--transport-velocity-weight", type=float, default=0.0)
     parser.add_argument("--transport-path-weight", type=float, default=0.0)
     parser.add_argument("--transport-monotonic-weight", type=float, default=0.0)
@@ -353,6 +369,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-weight", type=float, default=0.0)
     parser.add_argument("--prompt-balanced-bce-weight", type=float, default=0.0)
     parser.add_argument("--medical-prompt-aux-weight", type=float, default=0.0)
+    parser.add_argument("--closed-loop-feedback-weight", type=float, default=0.0)
+    parser.add_argument("--closed-loop-no-harm-weight", type=float, default=0.0)
+    parser.add_argument("--closed-loop-lesion-no-harm-weight", type=float, default=0.0)
+    parser.add_argument("--closed-loop-background-no-harm-weight", type=float, default=0.0)
+    parser.add_argument("--closed-loop-no-harm-margin", type=float, default=0.0)
     parser.add_argument("--prompt-max-pos-weight", type=float, default=50.0)
     parser.add_argument("--prompt-et-weight", type=float, default=3.0)
     parser.add_argument("--prompt-tc-weight", type=float, default=2.0)
@@ -1571,6 +1592,38 @@ def refinement_no_harm_loss(
         weights = (1.0 - lesion).clamp(0.0, 1.0)
     else:
         raise ValueError(f"Unknown no-harm region: {region}")
+    if not (weights > 0.0).any():
+        return target.new_zeros(())
+    return weighted_mean(harm, weights.clamp_min(1e-4))
+
+
+def closed_loop_no_harm_loss(
+    generated: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    target_regions: torch.Tensor,
+    dilation: int,
+    margin: float,
+    region: str,
+) -> torch.Tensor:
+    if "closed_loop_reference_synthetic" not in generated:
+        return target.new_zeros(())
+    synthetic = generated["synthetic"]
+    reference = generated["closed_loop_reference_synthetic"].detach()
+    final_error = (synthetic - target).abs()
+    reference_error = (reference - target).abs()
+    harm = F.relu(final_error - reference_error + float(margin))
+    lesion = lesion_refinement_target(target_regions, dilation).to(
+        device=target.device,
+        dtype=target.dtype,
+    )
+    if region == "all":
+        weights = torch.ones_like(harm)
+    elif region == "lesion":
+        weights = lesion
+    elif region == "background":
+        weights = (1.0 - lesion).clamp(0.0, 1.0)
+    else:
+        raise ValueError(f"Unknown closed-loop no-harm region: {region}")
     if not (weights > 0.0).any():
         return target.new_zeros(())
     return weighted_mean(harm, weights.clamp_min(1e-4))
@@ -3204,6 +3257,51 @@ def loss_for_batch(
             args.prompt_max_pos_weight,
             modality_prompt_channel_weights(args.target_modality, medical_logits.shape[1]),
         )
+    closed_loop_feedback = (
+        segmentation_loss(
+            generated["feedback_lesion_logits"],
+            batch["target_regions"],
+            region_weights=(args.prompt_et_weight, args.prompt_tc_weight, args.prompt_wt_weight),
+        )
+        if "feedback_lesion_logits" in generated and float(args.closed_loop_feedback_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    closed_loop_no_harm = (
+        closed_loop_no_harm_loss(
+            generated,
+            target,
+            batch["target_regions"],
+            args.gate_target_dilation,
+            args.closed_loop_no_harm_margin,
+            "all",
+        )
+        if float(args.closed_loop_no_harm_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    closed_loop_lesion_no_harm = (
+        closed_loop_no_harm_loss(
+            generated,
+            target,
+            batch["target_regions"],
+            args.gate_target_dilation,
+            args.closed_loop_no_harm_margin,
+            "lesion",
+        )
+        if float(args.closed_loop_lesion_no_harm_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
+    closed_loop_background_no_harm = (
+        closed_loop_no_harm_loss(
+            generated,
+            target,
+            batch["target_regions"],
+            args.gate_target_dilation,
+            args.closed_loop_no_harm_margin,
+            "background",
+        )
+        if float(args.closed_loop_background_no_harm_weight) > 0.0
+        else synthetic.new_zeros(())
+    )
     loss = (
         float(args.recon_weight) * recon
         + float(args.nll_weight) * nll
@@ -3247,6 +3345,10 @@ def loss_for_batch(
         + float(args.prompt_weight) * prompt
         + float(args.prompt_balanced_bce_weight) * prompt_bce
         + float(args.medical_prompt_aux_weight) * medical_prompt_aux
+        + float(args.closed_loop_feedback_weight) * closed_loop_feedback
+        + float(args.closed_loop_no_harm_weight) * closed_loop_no_harm
+        + float(args.closed_loop_lesion_no_harm_weight) * closed_loop_lesion_no_harm
+        + float(args.closed_loop_background_no_harm_weight) * closed_loop_background_no_harm
     )
     return loss, {
         "loss": float(loss.detach().cpu().item()),
@@ -3300,6 +3402,12 @@ def loss_for_batch(
         "prompt_loss": float(prompt.detach().cpu().item()),
         "prompt_balanced_bce": float(prompt_bce.detach().cpu().item()),
         "medical_prompt_aux": float(medical_prompt_aux.detach().cpu().item()),
+        "closed_loop_feedback": float(closed_loop_feedback.detach().cpu().item()),
+        "closed_loop_no_harm": float(closed_loop_no_harm.detach().cpu().item()),
+        "closed_loop_lesion_no_harm": float(closed_loop_lesion_no_harm.detach().cpu().item()),
+        "closed_loop_background_no_harm": float(
+            closed_loop_background_no_harm.detach().cpu().item()
+        ),
         "uncertainty_mean": float(uncertainty.detach().mean().cpu().item()),
         "confidence_mean": float(generated["confidence"].detach().mean().cpu().item()),
         "stage1_mae": float(
@@ -3318,6 +3426,21 @@ def loss_for_batch(
         ),
         "acceptance_mean": float(
             generated.get("refinement_acceptance", synthetic.new_zeros(()))
+            .detach()
+            .mean()
+            .cpu()
+            .item()
+        ),
+        "closed_loop_delta_mean": float(
+            generated.get("closed_loop_adapter_delta_velocities", synthetic.new_zeros(()))
+            .detach()
+            .abs()
+            .mean()
+            .cpu()
+            .item()
+        ),
+        "closed_loop_gate_mean": float(
+            generated.get("closed_loop_adapter_gate", synthetic.new_zeros(()))
             .detach()
             .mean()
             .cpu()
@@ -3454,6 +3577,33 @@ def evaluate(
             row["background_overshoot_rate"] = float(
                 weighted_mean(overshoot_map, background.clamp_min(1e-4)).cpu().item()
             )
+        if "closed_loop_reference_synthetic" in generated:
+            reference_error = (generated["closed_loop_reference_synthetic"] - target).abs()
+            row["closed_loop_reference_mae"] = float(reference_error.mean().cpu().item())
+            row["closed_loop_mae_delta_from_reference"] = (
+                row["mae"] - row["closed_loop_reference_mae"]
+            )
+            adapter_delta = (
+                synthetic - generated["closed_loop_reference_synthetic"]
+            ).abs()
+            row["closed_loop_delta_from_reference"] = float(
+                adapter_delta.mean().cpu().item()
+            )
+        if "closed_loop_adapter_gate" in generated:
+            gate = generated["closed_loop_adapter_gate"]
+            gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
+                device=gate.device,
+                dtype=gate.dtype,
+            )
+            background = (1.0 - gate_target).clamp(0.0, 1.0)
+            lesion = gate_target.clamp(0.0, 1.0)
+            row["closed_loop_gate_mean"] = float(gate.mean().cpu().item())
+            row["closed_loop_gate_lesion_mean"] = float(
+                weighted_mean(gate, lesion.clamp_min(1e-4)).cpu().item()
+            )
+            row["closed_loop_gate_background_mean"] = float(
+                weighted_mean(gate, background.clamp_min(1e-4)).cpu().item()
+            )
         if "refinement_gate" in generated:
             gate = generated["refinement_gate"]
             gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
@@ -3490,6 +3640,17 @@ def evaluate(
                     f"prompt_{key}": value
                     for key, value in dice_scores(
                         generated["prompt_logits"],
+                        batch["target_regions"],
+                        region_names=BRATS_REGIONS,
+                    ).items()
+                }
+            )
+        if "feedback_lesion_logits" in generated:
+            row.update(
+                {
+                    f"feedback_{key}": value
+                    for key, value in dice_scores(
+                        generated["feedback_lesion_logits"],
                         batch["target_regions"],
                         region_names=BRATS_REGIONS,
                     ).items()
@@ -3851,6 +4012,14 @@ def build_model(
                 role_hidden_channels=args.role_hidden_channels,
                 initial_residual_scale=args.initial_residual_scale,
                 prompt_channels=args.medical_prompt_channels,
+                closed_loop_token_drift=args.closed_loop_token_drift,
+                closed_loop_feedback_channels=args.closed_loop_feedback_channels,
+                closed_loop_token_channels=args.closed_loop_token_channels,
+                closed_loop_token_heads=args.closed_loop_token_heads,
+                closed_loop_token_stride=args.closed_loop_token_stride,
+                closed_loop_adapter_scale=args.closed_loop_adapter_scale,
+                closed_loop_gate_bias_init=args.closed_loop_gate_bias_init,
+                closed_loop_detach_feedback=args.closed_loop_detach_feedback,
                 gated_refinement=args.gated_refinement,
                 refinement_residual_scale=args.refinement_residual_scale,
                 gate_bias_init=args.gate_bias_init,
@@ -4096,6 +4265,27 @@ def freeze_prompted_base(
     train_prompt_with_detail: bool = False,
 ) -> dict[str, int]:
     if isinstance(model, SliceDriftTransportGenerator):
+        if bool(getattr(model.config, "closed_loop_token_drift", False)):
+            trainable_prefixes = closed_loop_trainable_prefixes()
+            if bool(getattr(model.config, "gated_refinement", False)):
+                trainable_prefixes = (
+                    *trainable_prefixes,
+                    "refinement_context.",
+                    "refinement_feature_project.",
+                    "refinement_gate_head.",
+                    "refinement_accept_head.",
+                    "refinement_residual_head.",
+                )
+            frozen = 0
+            trainable = 0
+            for name, parameter in model.named_parameters():
+                keep_trainable = name.startswith(trainable_prefixes)
+                parameter.requires_grad = keep_trainable
+                if keep_trainable:
+                    trainable += parameter.numel()
+                else:
+                    frozen += parameter.numel()
+            return {"frozen_parameters": frozen, "trainable_parameters": trainable}
         if not bool(getattr(model.config, "gated_refinement", False)):
             return {
                 "frozen_parameters": 0,
@@ -4344,6 +4534,7 @@ def main() -> int:
             "trainable_parameters": sum(p.numel() for p in model.parameters()),
         }
     )
+    freeze_report = freeze_report | closed_loop_parameter_report(model)
     optimizer_parameters = trainable_parameters(model)
     if not optimizer_parameters:
         raise RuntimeError("No trainable parameters selected")

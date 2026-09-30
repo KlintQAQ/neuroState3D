@@ -135,6 +135,22 @@ def load_model(
                 role_hidden_channels=int(config.get("role_hidden_channels", 0)),
                 initial_residual_scale=float(config.get("initial_residual_scale", 0.35)),
                 prompt_channels=int(config.get("medical_prompt_channels", 5)),
+                closed_loop_token_drift=bool(config.get("closed_loop_token_drift", False)),
+                closed_loop_feedback_channels=int(
+                    config.get("closed_loop_feedback_channels", 32)
+                ),
+                closed_loop_token_channels=int(config.get("closed_loop_token_channels", 64)),
+                closed_loop_token_heads=int(config.get("closed_loop_token_heads", 4)),
+                closed_loop_token_stride=int(config.get("closed_loop_token_stride", 4)),
+                closed_loop_adapter_scale=float(
+                    config.get("closed_loop_adapter_scale", 0.12)
+                ),
+                closed_loop_gate_bias_init=float(
+                    config.get("closed_loop_gate_bias_init", -3.0)
+                ),
+                closed_loop_detach_feedback=bool(
+                    config.get("closed_loop_detach_feedback", False)
+                ),
                 gated_refinement=bool(config.get("gated_refinement", False)),
                 refinement_residual_scale=float(config.get("refinement_residual_scale", 0.25)),
                 gate_bias_init=float(config.get("gate_bias_init", -3.0)),

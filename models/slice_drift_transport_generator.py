@@ -6,7 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.closed_loop_feedback import ClosedLoopFeedbackConfig, ClosedLoopFeedbackController
 from models.slice_virtual_modality_generator import ConvNormAct2d, ResidualConvBlock2d
+from models.token_drift_adapter import TokenDriftAdapter, TokenDriftAdapterConfig
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,14 @@ class SliceDriftTransportGeneratorConfig:
     role_hidden_channels: int = 0
     initial_residual_scale: float = 0.35
     prompt_channels: int = 5
+    closed_loop_token_drift: bool = False
+    closed_loop_feedback_channels: int = 32
+    closed_loop_token_channels: int = 64
+    closed_loop_token_heads: int = 4
+    closed_loop_token_stride: int = 4
+    closed_loop_adapter_scale: float = 0.12
+    closed_loop_gate_bias_init: float = -3.0
+    closed_loop_detach_feedback: bool = False
 
 
 class SliceDriftTransportGenerator(nn.Module):
@@ -137,6 +147,33 @@ class SliceDriftTransportGenerator(nn.Module):
         self.uncertainty_head = nn.Conv2d(hidden, 1, kernel_size=1)
         nn.init.zeros_(self.velocity_head.weight)
         nn.init.zeros_(self.velocity_head.bias)
+        self.closed_loop_token_drift = bool(self.config.closed_loop_token_drift)
+        if self.closed_loop_token_drift:
+            feedback_channels = int(self.config.closed_loop_feedback_channels)
+            token_channels = int(self.config.closed_loop_token_channels) or hidden
+            self.feedback_controller = ClosedLoopFeedbackController(
+                ClosedLoopFeedbackConfig(
+                    in_modalities=int(self.config.in_modalities),
+                    hidden_channels=hidden,
+                    feedback_channels=feedback_channels,
+                    prompt_channels=self.prompt_condition_channels,
+                    class_channels=class_channels,
+                    detach_feedback=bool(self.config.closed_loop_detach_feedback),
+                )
+            )
+            self.token_drift_adapter = TokenDriftAdapter(
+                TokenDriftAdapterConfig(
+                    in_modalities=int(self.config.in_modalities),
+                    hidden_channels=hidden,
+                    token_channels=token_channels,
+                    token_heads=int(self.config.closed_loop_token_heads),
+                    token_stride=int(self.config.closed_loop_token_stride),
+                    feedback_channels=feedback_channels,
+                    prompt_channels=self.prompt_condition_channels,
+                    adapter_scale=float(self.config.closed_loop_adapter_scale),
+                    gate_bias_init=float(self.config.closed_loop_gate_bias_init),
+                )
+            )
         if self.config.gated_refinement:
             detail_channels = 8 if bool(self.config.refinement_detail_features) else 0
             refinement_in_channels = (
@@ -208,12 +245,36 @@ class SliceDriftTransportGenerator(nn.Module):
         )
         states = [current]
         velocities = []
+        base_velocities = []
+        adapter_delta_velocities = []
+        adapter_gates = []
+        feedback_lesion_logits = []
+        feedback_failure_logits = []
+        reference_current = current.detach() if self.closed_loop_token_drift else None
+        reference_states = []
         uncertainty_raw = None
         last_features = None
         steps = max(1, int(self.config.transport_steps))
         for step in range(steps):
             progress = float(step) / float(max(steps - 1, 1))
             remaining = float(steps - step) / float(steps)
+            if reference_current is not None:
+                with torch.no_grad():
+                    reference_velocity, _, _ = self._velocity_step(
+                        reference_current,
+                        masked,
+                        mask_channels,
+                        progress,
+                        remaining,
+                        class_map,
+                        role_context,
+                        prompt_probs,
+                    )
+                    reference_current = self._activate(
+                        reference_current
+                        + float(self.config.transport_step_scale) * reference_velocity
+                    )
+                    reference_states.append(reference_current.detach())
             velocity, uncertainty_raw, last_features = self._velocity_step(
                 current,
                 masked,
@@ -224,9 +285,34 @@ class SliceDriftTransportGenerator(nn.Module):
                 role_context,
                 prompt_probs,
             )
+            base_velocity = velocity
+            if self.closed_loop_token_drift:
+                feedback = self.feedback_controller(
+                    current=current,
+                    masked=masked,
+                    mask_channels=mask_channels,
+                    base_features=last_features,
+                    uncertainty_raw=uncertainty_raw,
+                    prompt_probs=prompt_probs,
+                    class_map=class_map,
+                )
+                adapter = self.token_drift_adapter(
+                    current=current,
+                    masked=masked,
+                    mask_channels=mask_channels,
+                    feedback_map=feedback["feedback_map"],
+                    prompt_probs=prompt_probs,
+                )
+                delta_velocity = adapter["delta_velocity"]
+                velocity = base_velocity + delta_velocity
+                adapter_delta_velocities.append(delta_velocity)
+                adapter_gates.append(adapter["adapter_gate"])
+                feedback_lesion_logits.append(feedback["feedback_lesion_logits"])
+                feedback_failure_logits.append(feedback["feedback_failure_logits"])
             current = self._activate(
                 current + float(self.config.transport_step_scale) * velocity
             )
+            base_velocities.append(base_velocity)
             velocities.append(velocity)
             states.append(current)
         if uncertainty_raw is None:
@@ -290,6 +376,19 @@ class SliceDriftTransportGenerator(nn.Module):
                 dtype=slices.dtype,
             ),
         }
+        if base_velocities:
+            output["base_drift_velocities"] = torch.stack(base_velocities, dim=1)
+        if adapter_delta_velocities:
+            output["closed_loop_reference_synthetic"] = reference_current
+            output["closed_loop_reference_states"] = torch.stack(reference_states, dim=1)
+            output["closed_loop_adapter_delta_velocities"] = torch.stack(
+                adapter_delta_velocities,
+                dim=1,
+            )
+            output["closed_loop_adapter_gates"] = torch.stack(adapter_gates, dim=1)
+            output["closed_loop_adapter_gate"] = output["closed_loop_adapter_gates"].mean(dim=1)
+            output["feedback_lesion_logits"] = feedback_lesion_logits[-1]
+            output["feedback_failure_logits"] = feedback_failure_logits[-1]
         if refinement_gate is not None:
             output.update(
                 {

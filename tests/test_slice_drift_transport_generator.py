@@ -156,6 +156,57 @@ def test_stochastic_initial_state_is_controllable_and_eval_is_deterministic() ->
     assert not torch.equal(stochastic_a["drift_initial"], stochastic_b["drift_initial"])
 
 
+def test_closed_loop_token_drift_is_zero_init_compatible_with_base_transport() -> None:
+    base = SliceDriftTransportGenerator(
+        SliceDriftTransportGeneratorConfig(
+            in_modalities=4,
+            hidden_channels=8,
+            transport_steps=2,
+            medical_role_conditioning=True,
+            medical_prompt_conditioning=True,
+            prompt_channels=3,
+        )
+    )
+    closed_loop = SliceDriftTransportGenerator(
+        SliceDriftTransportGeneratorConfig(
+            in_modalities=4,
+            hidden_channels=8,
+            transport_steps=2,
+            medical_role_conditioning=True,
+            medical_prompt_conditioning=True,
+            prompt_channels=3,
+            closed_loop_token_drift=True,
+            closed_loop_feedback_channels=6,
+            closed_loop_token_channels=8,
+            closed_loop_token_heads=2,
+            closed_loop_token_stride=2,
+        )
+    )
+    missing, unexpected = closed_loop.load_state_dict(base.state_dict(), strict=False)
+    assert unexpected == []
+    assert any(key.startswith("feedback_controller.") for key in missing)
+    assert any(key.startswith("token_drift_adapter.") for key in missing)
+
+    image = torch.randn(2, 4, 20, 20)
+    mask = torch.ones(2, 4)
+    mask[:, 1] = 0.0
+
+    base.eval()
+    closed_loop.eval()
+    base_output = base(image, mask)
+    closed_output = closed_loop(image, mask)
+
+    assert torch.allclose(base_output["synthetic"], closed_output["synthetic"])
+    assert torch.allclose(
+        base_output["drift_velocities"],
+        closed_output["drift_velocities"],
+    )
+    assert closed_output["closed_loop_reference_synthetic"].shape == (2, 1, 20, 20)
+    assert closed_output["closed_loop_adapter_delta_velocities"].abs().max() == 0.0
+    assert closed_output["closed_loop_adapter_gate"].shape == (2, 1, 20, 20)
+    assert closed_output["feedback_lesion_logits"].shape == (2, 3, 20, 20)
+
+
 def test_training_slice_sampling_changes_by_epoch_but_is_reproducible(tmp_path) -> None:
     image_path = tmp_path / "image.npy"
     seg_path = tmp_path / "seg.npy"

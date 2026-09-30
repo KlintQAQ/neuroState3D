@@ -144,6 +144,19 @@ ROLE_HIDDEN_CHANNELS="${ROLE_HIDDEN_CHANNELS:-0}"
 INITIAL_RESIDUAL_SCALE="${INITIAL_RESIDUAL_SCALE:-0.30}"
 MEDICAL_PROMPT_CHANNELS="${MEDICAL_PROMPT_CHANNELS:-6}"
 MEDICAL_PROMPT_AUX_WEIGHT="${MEDICAL_PROMPT_AUX_WEIGHT:-0.03}"
+CLOSED_LOOP_TOKEN_DRIFT="${CLOSED_LOOP_TOKEN_DRIFT:-1}"
+CLOSED_LOOP_FEEDBACK_CHANNELS="${CLOSED_LOOP_FEEDBACK_CHANNELS:-32}"
+CLOSED_LOOP_TOKEN_CHANNELS="${CLOSED_LOOP_TOKEN_CHANNELS:-64}"
+CLOSED_LOOP_TOKEN_HEADS="${CLOSED_LOOP_TOKEN_HEADS:-4}"
+CLOSED_LOOP_TOKEN_STRIDE="${CLOSED_LOOP_TOKEN_STRIDE:-4}"
+CLOSED_LOOP_ADAPTER_SCALE="${CLOSED_LOOP_ADAPTER_SCALE:-0.10}"
+CLOSED_LOOP_GATE_BIAS_INIT="${CLOSED_LOOP_GATE_BIAS_INIT:--3.0}"
+CLOSED_LOOP_DETACH_FEEDBACK="${CLOSED_LOOP_DETACH_FEEDBACK:-0}"
+CLOSED_LOOP_FEEDBACK_WEIGHT="${CLOSED_LOOP_FEEDBACK_WEIGHT:-0.04}"
+CLOSED_LOOP_NO_HARM_WEIGHT="${CLOSED_LOOP_NO_HARM_WEIGHT:-0.10}"
+CLOSED_LOOP_LESION_NO_HARM_WEIGHT="${CLOSED_LOOP_LESION_NO_HARM_WEIGHT:-0.22}"
+CLOSED_LOOP_BACKGROUND_NO_HARM_WEIGHT="${CLOSED_LOOP_BACKGROUND_NO_HARM_WEIGHT:-0.22}"
+CLOSED_LOOP_NO_HARM_MARGIN="${CLOSED_LOOP_NO_HARM_MARGIN:-0.0}"
 SLICE_SAMPLING_MODE="${SLICE_SAMPLING_MODE:-medical_mixed}"
 MIXED_BACKGROUND_PROB="${MIXED_BACKGROUND_PROB:-0.06}"
 MIXED_ET_PROB="${MIXED_ET_PROB:-0.34}"
@@ -649,6 +662,12 @@ train_transport() {
   if [[ "${STOCHASTIC_INITIAL_STATE}" == "1" ]]; then
     medical_transport_args+=(--stochastic-initial-state)
   fi
+  if [[ "${CLOSED_LOOP_TOKEN_DRIFT}" == "1" ]]; then
+    medical_transport_args+=(--closed-loop-token-drift)
+  fi
+  if [[ "${CLOSED_LOOP_DETACH_FEEDBACK}" == "1" ]]; then
+    medical_transport_args+=(--closed-loop-detach-feedback)
+  fi
 
   local transport_args=(
     python scripts/train_slice_virtual_modality_drifting.py
@@ -681,6 +700,12 @@ train_transport() {
     --role-hidden-channels "${ROLE_HIDDEN_CHANNELS}"
     --initial-residual-scale "${INITIAL_RESIDUAL_SCALE}"
     --medical-prompt-channels "${MEDICAL_PROMPT_CHANNELS}"
+    --closed-loop-feedback-channels "${CLOSED_LOOP_FEEDBACK_CHANNELS}"
+    --closed-loop-token-channels "${CLOSED_LOOP_TOKEN_CHANNELS}"
+    --closed-loop-token-heads "${CLOSED_LOOP_TOKEN_HEADS}"
+    --closed-loop-token-stride "${CLOSED_LOOP_TOKEN_STRIDE}"
+    --closed-loop-adapter-scale "${CLOSED_LOOP_ADAPTER_SCALE}"
+    --closed-loop-gate-bias-init "${CLOSED_LOOP_GATE_BIAS_INIT}"
     --stochastic-noise-scale "${STOCHASTIC_NOISE_SCALE}"
     --output-activation hardtanh
     --transport-steps "${TRANSPORT_STEPS}"
@@ -708,6 +733,11 @@ train_transport() {
     --prompt-weight "${TRANSPORT_PROMPT_WEIGHT}"
     --prompt-balanced-bce-weight "${TRANSPORT_PROMPT_BALANCED_BCE_WEIGHT}"
     --medical-prompt-aux-weight "${MEDICAL_PROMPT_AUX_WEIGHT}"
+    --closed-loop-feedback-weight "${CLOSED_LOOP_FEEDBACK_WEIGHT}"
+    --closed-loop-no-harm-weight "${CLOSED_LOOP_NO_HARM_WEIGHT}"
+    --closed-loop-lesion-no-harm-weight "${CLOSED_LOOP_LESION_NO_HARM_WEIGHT}"
+    --closed-loop-background-no-harm-weight "${CLOSED_LOOP_BACKGROUND_NO_HARM_WEIGHT}"
+    --closed-loop-no-harm-margin "${CLOSED_LOOP_NO_HARM_MARGIN}"
     --prompt-et-weight 4
     --prompt-tc-weight 2
     --prompt-wt-weight 1
@@ -812,6 +842,12 @@ train_transport_stage2_noharm() {
   if [[ "${STOCHASTIC_INITIAL_STATE}" == "1" ]]; then
     medical_transport_args+=(--stochastic-initial-state)
   fi
+  if [[ "${CLOSED_LOOP_TOKEN_DRIFT}" == "1" ]]; then
+    medical_transport_args+=(--closed-loop-token-drift)
+  fi
+  if [[ "${CLOSED_LOOP_DETACH_FEEDBACK}" == "1" ]]; then
+    medical_transport_args+=(--closed-loop-detach-feedback)
+  fi
   local stage2_extra_args=()
   if [[ "${STAGE2_GATED_REFINEMENT}" == "1" ]]; then
     stage2_extra_args+=(
@@ -882,6 +918,12 @@ train_transport_stage2_noharm() {
       --role-hidden-channels "${ROLE_HIDDEN_CHANNELS}" \
       --initial-residual-scale "${INITIAL_RESIDUAL_SCALE}" \
       --medical-prompt-channels "${MEDICAL_PROMPT_CHANNELS}" \
+      --closed-loop-feedback-channels "${CLOSED_LOOP_FEEDBACK_CHANNELS}" \
+      --closed-loop-token-channels "${CLOSED_LOOP_TOKEN_CHANNELS}" \
+      --closed-loop-token-heads "${CLOSED_LOOP_TOKEN_HEADS}" \
+      --closed-loop-token-stride "${CLOSED_LOOP_TOKEN_STRIDE}" \
+      --closed-loop-adapter-scale "${CLOSED_LOOP_ADAPTER_SCALE}" \
+      --closed-loop-gate-bias-init "${CLOSED_LOOP_GATE_BIAS_INIT}" \
       --stochastic-noise-scale "${STOCHASTIC_NOISE_SCALE}" \
       "${stage2_extra_args[@]}" \
       --output-activation hardtanh \
@@ -924,6 +966,11 @@ train_transport_stage2_noharm() {
       --prompt-weight "${TRANSPORT_PROMPT_WEIGHT}" \
       --prompt-balanced-bce-weight "${TRANSPORT_PROMPT_BALANCED_BCE_WEIGHT}" \
       --medical-prompt-aux-weight "${MEDICAL_PROMPT_AUX_WEIGHT}" \
+      --closed-loop-feedback-weight "${CLOSED_LOOP_FEEDBACK_WEIGHT}" \
+      --closed-loop-no-harm-weight "${CLOSED_LOOP_NO_HARM_WEIGHT}" \
+      --closed-loop-lesion-no-harm-weight "${CLOSED_LOOP_LESION_NO_HARM_WEIGHT}" \
+      --closed-loop-background-no-harm-weight "${CLOSED_LOOP_BACKGROUND_NO_HARM_WEIGHT}" \
+      --closed-loop-no-harm-margin "${CLOSED_LOOP_NO_HARM_MARGIN}" \
       --prompt-et-weight 4 \
       --prompt-tc-weight 2 \
       --prompt-wt-weight 1 \
@@ -1226,6 +1273,7 @@ main() {
   stage_log "Pipeline root: ${ROOT}"
   stage_log "Run name: ${RUN_NAME}"
   stage_log "Data root: ${DATA_ROOT}"
+  stage_log "Closed-loop token drift: enabled=${CLOSED_LOOP_TOKEN_DRIFT}, token_channels=${CLOSED_LOOP_TOKEN_CHANNELS}, stride=${CLOSED_LOOP_TOKEN_STRIDE}, adapter_scale=${CLOSED_LOOP_ADAPTER_SCALE}"
   if command -v nvidia-smi >/dev/null 2>&1; then
     nvidia-smi || true
   fi
