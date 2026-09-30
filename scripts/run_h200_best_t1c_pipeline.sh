@@ -22,7 +22,7 @@ ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 
 export TARGET_MODALITY="${TARGET_MODALITY:-t1c}"
-export RUN_NAME="${RUN_NAME:-h200_medical_drift_${TARGET_MODALITY}}"
+export RUN_NAME="${RUN_NAME:-h200_closedloop_v2_${TARGET_MODALITY}}"
 
 # Keep large assets outside the git worktree by default.
 export DATA_ROOT="${DATA_ROOT:-/mnt/NeuroState3D_data}"
@@ -116,6 +116,9 @@ export CLOSED_LOOP_NO_HARM_WEIGHT="${CLOSED_LOOP_NO_HARM_WEIGHT:-0.10}"
 export CLOSED_LOOP_LESION_NO_HARM_WEIGHT="${CLOSED_LOOP_LESION_NO_HARM_WEIGHT:-0.24}"
 export CLOSED_LOOP_BACKGROUND_NO_HARM_WEIGHT="${CLOSED_LOOP_BACKGROUND_NO_HARM_WEIGHT:-0.24}"
 export CLOSED_LOOP_NO_HARM_MARGIN="${CLOSED_LOOP_NO_HARM_MARGIN:-0.0}"
+if [[ "${CLOSED_LOOP_TOKEN_DRIFT}" == "1" ]]; then
+  export TRANSPORT_BEST_METRIC="${TRANSPORT_BEST_METRIC:-closed_loop_noharm_composite}"
+fi
 export SLICE_SAMPLING_MODE="${SLICE_SAMPLING_MODE:-medical_mixed}"
 export MIXED_BACKGROUND_PROB="${MIXED_BACKGROUND_PROB:-0.06}"
 export MIXED_ET_PROB="${MIXED_ET_PROB:-0.34}"

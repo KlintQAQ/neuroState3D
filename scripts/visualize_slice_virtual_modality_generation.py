@@ -172,7 +172,14 @@ def load_model(
                 hidden_channels=int(config.get("hidden_channels", 32)),
             )
         )
-    model.load_state_dict(payload["model"], strict=False)
+    state = dict(payload["model"])
+    if isinstance(model, SliceDriftTransportGenerator):
+        # This historical head had neither supervision nor a generation consumer.
+        for key in ("feedback_controller.failure_head.weight", "feedback_controller.failure_head.bias"):
+            state.pop(key, None)
+        model.load_state_dict(state, strict=True)
+    else:
+        model.load_state_dict(state, strict=False)
     model.to(device).eval()
     return model, target
 
@@ -299,8 +306,9 @@ def generate_volume(
         sample_count = max(1, int(posterior_samples))
         outputs = []
         for _ in range(sample_count):
-            if isinstance(model, SliceDriftTransportGenerator) and sample_count > 1:
-                outputs.append(model(slices, batch_mask, batch_class, stochastic=True))
+            if isinstance(model, SliceDriftTransportGenerator):
+                outputs.append(model(slices, batch_mask, batch_class,
+                                     stochastic=sample_count > 1, compute_reference=False))
             else:
                 outputs.append(model(slices, batch_mask, batch_class))
         output = outputs[0]

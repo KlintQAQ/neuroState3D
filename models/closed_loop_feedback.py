@@ -19,7 +19,7 @@ class ClosedLoopFeedbackConfig:
 
 
 class ClosedLoopFeedbackController(nn.Module):
-    """Predict task-like feedback used to modulate the drift path.
+    """Predict internally supervised feedback used to modulate the drift path.
 
     The controller is deliberately image-conditioned rather than label-fed:
     training can supervise its lesion logits with BraTS regions, but inference
@@ -46,7 +46,6 @@ class ClosedLoopFeedbackController(nn.Module):
         )
         self.feedback_head = nn.Conv2d(hidden, int(config.feedback_channels), kernel_size=1)
         self.lesion_head = nn.Conv2d(hidden, 3, kernel_size=1)
-        self.failure_head = nn.Conv2d(hidden, 1, kernel_size=1)
 
     def forward(
         self,
@@ -57,6 +56,7 @@ class ClosedLoopFeedbackController(nn.Module):
         uncertainty_raw: torch.Tensor,
         prompt_probs: torch.Tensor | None = None,
         class_map: torch.Tensor | None = None,
+        predict_lesions: bool = True,
     ) -> dict[str, torch.Tensor]:
         b, _, h, w = current.shape
         uncertainty = torch.nn.functional.softplus(uncertainty_raw)
@@ -86,9 +86,10 @@ class ClosedLoopFeedbackController(nn.Module):
         feedback = torch.tanh(self.feedback_head(features))
         if bool(self.config.detach_feedback):
             feedback = feedback.detach()
-        return {
+        output = {
             "feedback_map": feedback,
             "feedback_features": features,
-            "feedback_lesion_logits": self.lesion_head(features),
-            "feedback_failure_logits": self.failure_head(features),
         }
+        if predict_lesions:
+            output["feedback_lesion_logits"] = self.lesion_head(features)
+        return output

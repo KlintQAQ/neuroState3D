@@ -130,7 +130,11 @@ TRANSPORT_INIT_BLUR_KERNEL="${TRANSPORT_INIT_BLUR_KERNEL:-5}"
 TRANSPORT_VELOCITY_WEIGHT="${TRANSPORT_VELOCITY_WEIGHT:-0.55}"
 TRANSPORT_PATH_WEIGHT="${TRANSPORT_PATH_WEIGHT:-0.25}"
 TRANSPORT_MONOTONIC_WEIGHT="${TRANSPORT_MONOTONIC_WEIGHT:-0.08}"
-TRANSPORT_BEST_METRIC="${TRANSPORT_BEST_METRIC:-lesion_composite}"
+if [[ "${CLOSED_LOOP_TOKEN_DRIFT:-1}" == "1" ]]; then
+  TRANSPORT_BEST_METRIC="${TRANSPORT_BEST_METRIC:-closed_loop_noharm_composite}"
+else
+  TRANSPORT_BEST_METRIC="${TRANSPORT_BEST_METRIC:-lesion_composite}"
+fi
 TRANSPORT_PROMPT_WEIGHT="${TRANSPORT_PROMPT_WEIGHT:-0.08}"
 TRANSPORT_PROMPT_BALANCED_BCE_WEIGHT="${TRANSPORT_PROMPT_BALANCED_BCE_WEIGHT:-0.04}"
 TARGET_AWARE_MEDICAL_DEFAULTS="${TARGET_AWARE_MEDICAL_DEFAULTS:-1}"
@@ -633,6 +637,10 @@ train_transport() {
     return
   fi
   local transport_resume_checkpoint="${TRANSPORT_RESUME_CHECKPOINT}"
+  if [[ -n "${transport_resume_checkpoint}" && ! -f "${transport_resume_checkpoint}" ]]; then
+    echo "Transport checkpoint does not exist: ${transport_resume_checkpoint}" >&2
+    return 1
+  fi
   local latest_transport_step
   latest_transport_step="$(latest_resume_checkpoint "${FINAL_OUTPUT_DIR}" "${FINAL_STEP_CHECKPOINT}" "${FINAL_CHECKPOINT}")"
   if [[ -z "${transport_resume_checkpoint}" && ! -f "${FINAL_REPORT}" && -n "${latest_transport_step}" ]]; then
@@ -644,6 +652,13 @@ train_transport() {
   fi
 
   local medical_transport_args=()
+  if [[ "${FREEZE_TRANSPORT_BASE:-0}" == "1" ]]; then
+    if [[ -z "${transport_resume_checkpoint}" ]]; then
+      echo "FREEZE_TRANSPORT_BASE=1 requires TRANSPORT_RESUME_CHECKPOINT" >&2
+      return 1
+    fi
+    medical_transport_args+=(--freeze-base-generator)
+  fi
   if [[ "${TARGET_AWARE_MEDICAL_DEFAULTS}" == "1" ]]; then
     medical_transport_args+=(--target-aware-medical-defaults)
   fi
@@ -695,6 +710,10 @@ train_transport() {
     --max-train-steps "${MAX_TRAIN_STEPS}"
     --batch-size "${BATCH_SIZE}"
     --num-workers "${NUM_WORKERS}"
+    --cpu-threads "${CPU_THREADS:-4}"
+    --profile-steps "${PROFILE_STEPS:-0}"
+    --segmentation-loss-version "${SEGMENTATION_LOSS_VERSION:-2}"
+    --evaluation-version "${EVALUATION_VERSION:-2}"
     --hidden-channels "${HIDDEN_CHANNELS}"
     "${medical_transport_args[@]}"
     --role-hidden-channels "${ROLE_HIDDEN_CHANNELS}"

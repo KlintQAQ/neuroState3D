@@ -216,6 +216,7 @@ class SliceDriftTransportGenerator(nn.Module):
         class_condition: torch.Tensor | None = None,
         stochastic: bool | None = None,
         initial_noise: torch.Tensor | None = None,
+        compute_reference: bool = True,
     ) -> dict[str, torch.Tensor]:
         if slices.ndim != 4:
             raise ValueError(f"Expected slices [B,M,H,W], got {tuple(slices.shape)}")
@@ -249,8 +250,7 @@ class SliceDriftTransportGenerator(nn.Module):
         adapter_delta_velocities = []
         adapter_gates = []
         feedback_lesion_logits = []
-        feedback_failure_logits = []
-        reference_current = current.detach() if self.closed_loop_token_drift else None
+        reference_current = current.detach() if self.closed_loop_token_drift and compute_reference else None
         reference_states = []
         uncertainty_raw = None
         last_features = None
@@ -295,6 +295,7 @@ class SliceDriftTransportGenerator(nn.Module):
                     uncertainty_raw=uncertainty_raw,
                     prompt_probs=prompt_probs,
                     class_map=class_map,
+                    predict_lesions=step == steps - 1,
                 )
                 adapter = self.token_drift_adapter(
                     current=current,
@@ -307,8 +308,8 @@ class SliceDriftTransportGenerator(nn.Module):
                 velocity = base_velocity + delta_velocity
                 adapter_delta_velocities.append(delta_velocity)
                 adapter_gates.append(adapter["adapter_gate"])
-                feedback_lesion_logits.append(feedback["feedback_lesion_logits"])
-                feedback_failure_logits.append(feedback["feedback_failure_logits"])
+                if "feedback_lesion_logits" in feedback:
+                    feedback_lesion_logits.append(feedback["feedback_lesion_logits"])
             current = self._activate(
                 current + float(self.config.transport_step_scale) * velocity
             )
@@ -377,10 +378,14 @@ class SliceDriftTransportGenerator(nn.Module):
             ),
         }
         if base_velocities:
-            output["base_drift_velocities"] = torch.stack(base_velocities, dim=1)
+            output["base_drift_velocities"] = (
+                torch.stack(base_velocities, dim=1)
+                if self.closed_loop_token_drift else output["drift_velocities"]
+            )
         if adapter_delta_velocities:
-            output["closed_loop_reference_synthetic"] = reference_current
-            output["closed_loop_reference_states"] = torch.stack(reference_states, dim=1)
+            if reference_current is not None:
+                output["closed_loop_reference_synthetic"] = reference_current
+                output["closed_loop_reference_states"] = torch.stack(reference_states, dim=1)
             output["closed_loop_adapter_delta_velocities"] = torch.stack(
                 adapter_delta_velocities,
                 dim=1,
@@ -388,7 +393,6 @@ class SliceDriftTransportGenerator(nn.Module):
             output["closed_loop_adapter_gates"] = torch.stack(adapter_gates, dim=1)
             output["closed_loop_adapter_gate"] = output["closed_loop_adapter_gates"].mean(dim=1)
             output["feedback_lesion_logits"] = feedback_lesion_logits[-1]
-            output["feedback_failure_logits"] = feedback_failure_logits[-1]
         if refinement_gate is not None:
             output.update(
                 {

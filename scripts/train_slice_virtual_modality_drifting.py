@@ -249,9 +249,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--best-metric",
         default="mae",
-        choices=("mae", "lesion_composite", "lesion_noharm_composite"),
+        choices=("mae", "lesion_composite", "lesion_noharm_composite", "closed_loop_noharm_composite"),
     )
     parser.add_argument("--freeze-base-generator", action="store_true")
+    parser.add_argument("--segmentation-loss-version", type=int, choices=(1, 2), default=2,
+                        help="2 averages weighted losses across samples; 1 reproduces legacy training.")
+    parser.add_argument("--evaluation-version", type=int, choices=(1, 2), default=2,
+                        help="2 aggregates per-slice metrics; 1 reproduces legacy batch metrics.")
     parser.add_argument("--detail-only-refinement", action="store_true")
     parser.add_argument("--train-prompt-with-detail", action="store_true")
     parser.add_argument("--hidden-channels", type=int, default=32)
@@ -456,9 +460,17 @@ def exact_resume_config_mismatches(
         "checkpoint_keep_last",
         "step_checkpoint_name",
     }
+    # Absent version fields identify legacy objective/validation semantics.
+    checkpoint_config = dict(checkpoint_config)
+    checkpoint_config.setdefault("segmentation_loss_version", 1)
+    checkpoint_config.setdefault("evaluation_version", 1)
+    old_closed_loop = bool(checkpoint_config.get("closed_loop_token_drift", False))
+    new_closed_loop = bool(current_config.get("closed_loop_token_drift", False))
     mismatches: dict[str, dict[str, Any]] = {}
     for key, current_value in current_config.items():
         if key in operational_keys:
+            continue
+        if key.startswith("closed_loop_") and not old_closed_loop and not new_closed_loop:
             continue
         if key not in checkpoint_config:
             mismatches[key] = {"checkpoint": "<missing>", "current": current_value}
@@ -691,8 +703,10 @@ class BraTSSliceDataset(Dataset):
         row_index = index // self.slices_per_subject
         local_index = index % self.slices_per_subject
         row = self.rows[row_index]
-        image = np.load(row["multimodal_path"]).astype(np.float32, copy=False)
-        seg = np.load(row["seg_path"]).astype(np.int64, copy=False)
+        image = np.load(row["multimodal_path"], mmap_mode="r")
+        seg = np.load(row["seg_path"], mmap_mode="r")
+        if not np.issubdtype(seg.dtype, np.integer):
+            seg = seg.astype(np.int64)
         rng = random.Random(
             self.seed
             + self.epoch * 1_000_003
@@ -704,7 +718,7 @@ class BraTSSliceDataset(Dataset):
             if self.enumerate_all_slices
             else self._sample_slice(seg, rng, row["subject_id"])
         )
-        image_slice = self._context_slices(image, z)
+        image_slice = self._context_slices(image, z).float()
         target = torch.from_numpy(brats_region_targets_np(seg[:, :, z]))
         if self.slice_crop_mode == "region_balanced" and self.slice_crop_size > 0:
             image_slice, target = self._crop_slice_around_region(
@@ -991,12 +1005,15 @@ def generator_forward(
     image: torch.Tensor,
     observed_mask: torch.Tensor,
     batch: dict[str, Any],
+    compute_reference: bool = True,
 ) -> dict[str, torch.Tensor]:
     class_condition = (
         class_condition_from_batch(batch, image.device)
         if getattr(model.config, "class_conditioned", False)
         else None
     )
+    if isinstance(model, SliceDriftTransportGenerator):
+        return model(image, observed_mask, class_condition, compute_reference=compute_reference)
     return model(image, observed_mask, class_condition)
 
 
@@ -1626,7 +1643,7 @@ def closed_loop_no_harm_loss(
         raise ValueError(f"Unknown closed-loop no-harm region: {region}")
     if not (weights > 0.0).any():
         return target.new_zeros(())
-    return weighted_mean(harm, weights.clamp_min(1e-4))
+    return weighted_mean(harm, weights)
 
 
 def refinement_acceptance_supervision_loss(
@@ -2851,7 +2868,12 @@ def loss_for_batch(
     image = batch["image"]
     target_index = int(batch["target_index"][0].item())
     target = image[:, target_index : target_index + 1]
-    generated = generator_forward(model, image, batch["observed_mask"], batch)
+    needs_reference = any(float(getattr(args, name, 0.0)) > 0.0 for name in (
+        "closed_loop_no_harm_weight", "closed_loop_lesion_no_harm_weight",
+        "closed_loop_background_no_harm_weight",
+    ))
+    generated = generator_forward(model, image, batch["observed_mask"], batch,
+                                  compute_reference=needs_reference)
     synthetic = generated["synthetic"]
     uncertainty = generated["uncertainty"]
     focus_base, focus_et, focus_tc, focus_wt = modality_focus_weights(args)
@@ -3228,6 +3250,7 @@ def loss_for_batch(
             generated["prompt_logits"],
             batch["target_regions"],
             region_weights=(args.prompt_et_weight, args.prompt_tc_weight, args.prompt_wt_weight),
+            legacy_batch_sum=getattr(args, "segmentation_loss_version", 2) == 1,
         )
         if "prompt_logits" in generated and float(args.prompt_weight) > 0.0
         else synthetic.new_zeros(())
@@ -3262,6 +3285,7 @@ def loss_for_batch(
             generated["feedback_lesion_logits"],
             batch["target_regions"],
             region_weights=(args.prompt_et_weight, args.prompt_tc_weight, args.prompt_wt_weight),
+            legacy_batch_sum=getattr(args, "segmentation_loss_version", 2) == 1,
         )
         if "feedback_lesion_logits" in generated and float(args.closed_loop_feedback_weight) > 0.0
         else synthetic.new_zeros(())
@@ -3465,6 +3489,7 @@ def evaluate(
     model: SliceVirtualModalityGenerator | PromptedSliceVirtualModalityGenerator | SliceDriftTransportGenerator,
     loader: DataLoader,
     device: str,
+    evaluation_version: int = 2,
 ) -> dict[str, float]:
     model.eval()
     rows = []
@@ -3474,212 +3499,236 @@ def evaluate(
         target_index = int(batch["target_index"][0].item())
         target = image[:, target_index : target_index + 1]
         generated = generator_forward(model, image, batch["observed_mask"], batch)
-        synthetic = generated["synthetic"]
-        error = (synthetic - target).abs()
-        synthetic_features = conv_medical_features_2d(synthetic)
-        target_features = conv_medical_features_2d(target)
-        edge_error = (synthetic_features[:, 3:4] - target_features[:, 3:4]).abs()
-        laplacian_error = (synthetic_features[:, 4:5] - target_features[:, 4:5]).abs()
-        ssim_map = ssim_map_2d(synthetic, target)
-        tumor = batch["target_regions"][:, 2:3] > 0.5
-        if tumor.any():
-            high_threshold = torch.quantile(target[tumor].detach().float(), 0.70)
-            high_tumor = tumor & (target >= high_threshold)
-        else:
-            high_tumor = torch.zeros_like(tumor)
-        high_tumor_under = F.relu(target - synthetic)
-        mse = (synthetic - target).square().mean().clamp_min(1e-8)
-        psnr = 20.0 * math.log10(2.0) - 10.0 * math.log10(float(mse.cpu().item()))
-        row = {
-            "mae": float(error.mean().cpu().item()),
-            "mse": float(mse.cpu().item()),
-            "psnr": psnr,
-            "ssim": float(ssim_map.mean().cpu().item()),
-            "edge_mae": float(edge_error.mean().cpu().item()),
-            "laplacian_mae": float(laplacian_error.mean().cpu().item()),
-            "confidence_mean": float(generated["confidence"].mean().cpu().item()),
-            "uncertainty_mean": float(generated["uncertainty"].mean().cpu().item()),
-            "uncertainty_error_corr": pearson_correlation(generated["uncertainty"], error),
-            "high_tumor_mae": (
-                float(error[high_tumor].mean().cpu().item()) if high_tumor.any() else float("nan")
-            ),
-            "high_tumor_under": (
-                float(high_tumor_under[high_tumor].mean().cpu().item())
-                if high_tumor.any()
-                else float("nan")
-            ),
-        }
-        if "stage1_synthetic" in generated:
-            stage1_error = (generated["stage1_synthetic"] - target).abs()
-            stage1_under = F.relu(target - generated["stage1_synthetic"])
-            row["stage1_mae"] = float(stage1_error.mean().cpu().item())
-            row["stage1_high_tumor_mae"] = (
-                float(stage1_error[high_tumor].mean().cpu().item())
-                if high_tumor.any()
-                else float("nan")
-            )
-            row["stage1_high_tumor_under"] = (
-                float(stage1_under[high_tumor].mean().cpu().item())
-                if high_tumor.any()
-                else float("nan")
-            )
-            row["high_tumor_mae_delta_from_stage1"] = (
-                row["high_tumor_mae"] - row["stage1_high_tumor_mae"]
-                if high_tumor.any()
-                else float("nan")
-            )
-            row["high_tumor_under_delta_from_stage1"] = (
-                row["high_tumor_under"] - row["stage1_high_tumor_under"]
-                if high_tumor.any()
-                else float("nan")
-            )
-            harm_map = (error > stage1_error + 1e-4).float()
-            improvement_map = (error + 1e-4 < stage1_error).float()
-            applied_delta = (synthetic - generated["stage1_synthetic"]).abs()
-            overshoot_map = (applied_delta > stage1_error.detach() + 1e-4).float()
-            row["refinement_harm_rate"] = float(harm_map.mean().cpu().item())
-            row["refinement_improvement_rate"] = float(improvement_map.mean().cpu().item())
-            row["refinement_overshoot_rate"] = float(overshoot_map.mean().cpu().item())
-            row["delta_from_stage1"] = float(
-                applied_delta.mean().cpu().item()
-            )
-            gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
-                device=synthetic.device,
-                dtype=synthetic.dtype,
-            )
-            background = (1.0 - gate_target).clamp(0.0, 1.0)
-            lesion = gate_target.clamp(0.0, 1.0)
-            row["background_delta_from_stage1"] = float(
-                weighted_mean(
-                    applied_delta,
-                    background.clamp_min(1e-4),
-                )
-                .cpu()
-                .item()
-            )
-            row["lesion_delta_from_stage1"] = float(
-                weighted_mean(
-                    applied_delta,
-                    lesion.clamp_min(1e-4),
-                )
-                .cpu()
-                .item()
-            )
-            row["lesion_harm_rate"] = float(
-                weighted_mean(harm_map, lesion.clamp_min(1e-4)).cpu().item()
-            )
-            row["background_harm_rate"] = float(
-                weighted_mean(harm_map, background.clamp_min(1e-4)).cpu().item()
-            )
-            row["lesion_overshoot_rate"] = float(
-                weighted_mean(overshoot_map, lesion.clamp_min(1e-4)).cpu().item()
-            )
-            row["background_overshoot_rate"] = float(
-                weighted_mean(overshoot_map, background.clamp_min(1e-4)).cpu().item()
-            )
-        if "closed_loop_reference_synthetic" in generated:
-            reference_error = (generated["closed_loop_reference_synthetic"] - target).abs()
-            row["closed_loop_reference_mae"] = float(reference_error.mean().cpu().item())
-            row["closed_loop_mae_delta_from_reference"] = (
-                row["mae"] - row["closed_loop_reference_mae"]
-            )
-            adapter_delta = (
-                synthetic - generated["closed_loop_reference_synthetic"]
-            ).abs()
-            row["closed_loop_delta_from_reference"] = float(
-                adapter_delta.mean().cpu().item()
-            )
-        if "closed_loop_adapter_gate" in generated:
-            gate = generated["closed_loop_adapter_gate"]
-            gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
-                device=gate.device,
-                dtype=gate.dtype,
-            )
-            background = (1.0 - gate_target).clamp(0.0, 1.0)
-            lesion = gate_target.clamp(0.0, 1.0)
-            row["closed_loop_gate_mean"] = float(gate.mean().cpu().item())
-            row["closed_loop_gate_lesion_mean"] = float(
-                weighted_mean(gate, lesion.clamp_min(1e-4)).cpu().item()
-            )
-            row["closed_loop_gate_background_mean"] = float(
-                weighted_mean(gate, background.clamp_min(1e-4)).cpu().item()
-            )
-        if "refinement_gate" in generated:
-            gate = generated["refinement_gate"]
-            gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
-                device=gate.device,
-                dtype=gate.dtype,
-            )
-            background = (1.0 - gate_target).clamp(0.0, 1.0)
-            lesion = gate_target.clamp(0.0, 1.0)
-            row["gate_mean"] = float(gate.mean().cpu().item())
-            row["gate_lesion_mean"] = float(
-                weighted_mean(gate, lesion.clamp_min(1e-4)).cpu().item()
-            )
-            row["gate_background_mean"] = float(
-                weighted_mean(gate, background.clamp_min(1e-4)).cpu().item()
-            )
-        if "refinement_acceptance" in generated:
-            acceptance = generated["refinement_acceptance"]
-            gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
-                device=acceptance.device,
-                dtype=acceptance.dtype,
-            )
-            background = (1.0 - gate_target).clamp(0.0, 1.0)
-            lesion = gate_target.clamp(0.0, 1.0)
-            row["acceptance_mean"] = float(acceptance.mean().cpu().item())
-            row["acceptance_lesion_mean"] = float(
-                weighted_mean(acceptance, lesion.clamp_min(1e-4)).cpu().item()
-            )
-            row["acceptance_background_mean"] = float(
-                weighted_mean(acceptance, background.clamp_min(1e-4)).cpu().item()
-            )
-        if "prompt_logits" in generated:
-            row.update(
-                {
-                    f"prompt_{key}": value
-                    for key, value in dice_scores(
-                        generated["prompt_logits"],
-                        batch["target_regions"],
-                        region_names=BRATS_REGIONS,
-                    ).items()
-                }
-            )
-        if "feedback_lesion_logits" in generated:
-            row.update(
-                {
-                    f"feedback_{key}": value
-                    for key, value in dice_scores(
-                        generated["feedback_lesion_logits"],
-                        batch["target_regions"],
-                        region_names=BRATS_REGIONS,
-                    ).items()
-                }
-            )
-        for index, region in enumerate(BRATS_REGIONS):
-            mask = batch["target_regions"][:, index : index + 1] > 0.5
-            row[f"mae_{region}"] = (
-                float(error[mask].mean().cpu().item()) if mask.any() else float("nan")
-            )
+        batch_all, generated_all, target_all = batch, generated, target
+        sample_groups = [slice(None)] if evaluation_version == 1 else [
+            slice(i, i + 1) for i in range(image.shape[0])
+        ]
+        for sample in sample_groups:
+            batch = {key: value[sample] if torch.is_tensor(value) and value.ndim else value
+                     for key, value in batch_all.items()}
+            generated = {key: value[sample] if torch.is_tensor(value) and value.ndim else value
+                         for key, value in generated_all.items()}
+            target = target_all[sample]
+            synthetic = generated["synthetic"]
+            error = (synthetic - target).abs()
+            synthetic_features = conv_medical_features_2d(synthetic)
+            target_features = conv_medical_features_2d(target)
+            edge_error = (synthetic_features[:, 3:4] - target_features[:, 3:4]).abs()
+            laplacian_error = (synthetic_features[:, 4:5] - target_features[:, 4:5]).abs()
+            ssim_map = ssim_map_2d(synthetic, target)
+            tumor = batch["target_regions"][:, 2:3] > 0.5
+            if tumor.any():
+                high_threshold = torch.quantile(target[tumor].detach().float(), 0.70)
+                high_tumor = tumor & (target >= high_threshold)
+            else:
+                high_tumor = torch.zeros_like(tumor)
+            high_tumor_under = F.relu(target - synthetic)
+            mse = (synthetic - target).square().mean().clamp_min(1e-8)
+            psnr = 20.0 * math.log10(2.0) - 10.0 * math.log10(float(mse.cpu().item()))
+            row = {
+                "mae": float(error.mean().cpu().item()),
+                "mse": float(mse.cpu().item()),
+                "psnr": psnr,
+                "ssim": float(ssim_map.mean().cpu().item()),
+                "edge_mae": float(edge_error.mean().cpu().item()),
+                "laplacian_mae": float(laplacian_error.mean().cpu().item()),
+                "confidence_mean": float(generated["confidence"].mean().cpu().item()),
+                "uncertainty_mean": float(generated["uncertainty"].mean().cpu().item()),
+                "uncertainty_error_corr": pearson_correlation(generated["uncertainty"], error),
+                "high_tumor_mae": (
+                    float(error[high_tumor].mean().cpu().item()) if high_tumor.any() else float("nan")
+                ),
+                "high_tumor_under": (
+                    float(high_tumor_under[high_tumor].mean().cpu().item())
+                    if high_tumor.any()
+                    else float("nan")
+                ),
+            }
             if "stage1_synthetic" in generated:
-                row[f"stage1_mae_{region}"] = (
-                    float(stage1_error[mask].mean().cpu().item()) if mask.any() else float("nan")
-                )
-                row[f"mae_{region}_delta_from_stage1"] = (
-                    row[f"mae_{region}"] - row[f"stage1_mae_{region}"]
-                    if mask.any()
+                stage1_error = (generated["stage1_synthetic"] - target).abs()
+                stage1_under = F.relu(target - generated["stage1_synthetic"])
+                row["stage1_mae"] = float(stage1_error.mean().cpu().item())
+                row["stage1_high_tumor_mae"] = (
+                    float(stage1_error[high_tumor].mean().cpu().item())
+                    if high_tumor.any()
                     else float("nan")
                 )
-            row[f"ssim_{region}"] = (
-                float(ssim_map[mask].mean().cpu().item()) if mask.any() else float("nan")
-            )
-            row[f"edge_mae_{region}"] = (
-                float(edge_error[mask].mean().cpu().item()) if mask.any() else float("nan")
-            )
-            row[f"laplacian_mae_{region}"] = (
-                float(laplacian_error[mask].mean().cpu().item()) if mask.any() else float("nan")
-            )
-        rows.append(row)
+                row["stage1_high_tumor_under"] = (
+                    float(stage1_under[high_tumor].mean().cpu().item())
+                    if high_tumor.any()
+                    else float("nan")
+                )
+                row["high_tumor_mae_delta_from_stage1"] = (
+                    row["high_tumor_mae"] - row["stage1_high_tumor_mae"]
+                    if high_tumor.any()
+                    else float("nan")
+                )
+                row["high_tumor_under_delta_from_stage1"] = (
+                    row["high_tumor_under"] - row["stage1_high_tumor_under"]
+                    if high_tumor.any()
+                    else float("nan")
+                )
+                harm_map = (error > stage1_error + 1e-4).float()
+                improvement_map = (error + 1e-4 < stage1_error).float()
+                applied_delta = (synthetic - generated["stage1_synthetic"]).abs()
+                overshoot_map = (applied_delta > stage1_error.detach() + 1e-4).float()
+                row["refinement_harm_rate"] = float(harm_map.mean().cpu().item())
+                row["refinement_improvement_rate"] = float(improvement_map.mean().cpu().item())
+                row["refinement_overshoot_rate"] = float(overshoot_map.mean().cpu().item())
+                row["delta_from_stage1"] = float(
+                    applied_delta.mean().cpu().item()
+                )
+                gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
+                    device=synthetic.device,
+                    dtype=synthetic.dtype,
+                )
+                background = (1.0 - gate_target).clamp(0.0, 1.0)
+                lesion = gate_target.clamp(0.0, 1.0)
+                row["background_delta_from_stage1"] = float(
+                    weighted_mean(
+                        applied_delta,
+                        background.clamp_min(1e-4),
+                    )
+                    .cpu()
+                    .item()
+                )
+                row["lesion_delta_from_stage1"] = float(
+                    weighted_mean(
+                        applied_delta,
+                        lesion.clamp_min(1e-4),
+                    )
+                    .cpu()
+                    .item()
+                )
+                row["lesion_harm_rate"] = float(
+                    weighted_mean(harm_map, lesion.clamp_min(1e-4)).cpu().item()
+                )
+                row["background_harm_rate"] = float(
+                    weighted_mean(harm_map, background.clamp_min(1e-4)).cpu().item()
+                )
+                row["lesion_overshoot_rate"] = float(
+                    weighted_mean(overshoot_map, lesion.clamp_min(1e-4)).cpu().item()
+                )
+                row["background_overshoot_rate"] = float(
+                    weighted_mean(overshoot_map, background.clamp_min(1e-4)).cpu().item()
+                )
+            if "closed_loop_reference_synthetic" in generated:
+                reference_error = (generated["closed_loop_reference_synthetic"] - target).abs()
+                row["closed_loop_reference_mae"] = float(reference_error.mean().cpu().item())
+                row["closed_loop_harm_rate"] = float(
+                    (error > reference_error + 1e-4).float().mean().cpu().item()
+                )
+                row["closed_loop_mae_delta_from_reference"] = (
+                    row["mae"] - row["closed_loop_reference_mae"]
+                )
+                adapter_delta = (
+                    synthetic - generated["closed_loop_reference_synthetic"]
+                ).abs()
+                row["closed_loop_delta_from_reference"] = float(
+                    adapter_delta.mean().cpu().item()
+                )
+            if "closed_loop_adapter_gate" in generated:
+                gate = generated["closed_loop_adapter_gate"]
+                gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
+                    device=gate.device,
+                    dtype=gate.dtype,
+                )
+                background = (1.0 - gate_target).clamp(0.0, 1.0)
+                lesion = gate_target.clamp(0.0, 1.0)
+                row["closed_loop_gate_mean"] = float(gate.mean().cpu().item())
+                row["closed_loop_gate_lesion_mean"] = float(
+                    weighted_mean(gate, lesion.clamp_min(1e-4)).cpu().item()
+                )
+                row["closed_loop_gate_background_mean"] = float(
+                    weighted_mean(gate, background.clamp_min(1e-4)).cpu().item()
+                )
+            if "refinement_gate" in generated:
+                gate = generated["refinement_gate"]
+                gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
+                    device=gate.device,
+                    dtype=gate.dtype,
+                )
+                background = (1.0 - gate_target).clamp(0.0, 1.0)
+                lesion = gate_target.clamp(0.0, 1.0)
+                row["gate_mean"] = float(gate.mean().cpu().item())
+                row["gate_lesion_mean"] = float(
+                    weighted_mean(gate, lesion.clamp_min(1e-4)).cpu().item()
+                )
+                row["gate_background_mean"] = float(
+                    weighted_mean(gate, background.clamp_min(1e-4)).cpu().item()
+                )
+            if "refinement_acceptance" in generated:
+                acceptance = generated["refinement_acceptance"]
+                gate_target = lesion_refinement_target(batch["target_regions"], dilation=2).to(
+                    device=acceptance.device,
+                    dtype=acceptance.dtype,
+                )
+                background = (1.0 - gate_target).clamp(0.0, 1.0)
+                lesion = gate_target.clamp(0.0, 1.0)
+                row["acceptance_mean"] = float(acceptance.mean().cpu().item())
+                row["acceptance_lesion_mean"] = float(
+                    weighted_mean(acceptance, lesion.clamp_min(1e-4)).cpu().item()
+                )
+                row["acceptance_background_mean"] = float(
+                    weighted_mean(acceptance, background.clamp_min(1e-4)).cpu().item()
+                )
+            if "prompt_logits" in generated:
+                row.update(
+                    {
+                        f"prompt_{key}": value
+                        for key, value in dice_scores(
+                            generated["prompt_logits"],
+                            batch["target_regions"],
+                            region_names=BRATS_REGIONS,
+                        ).items()
+                    }
+                )
+            if "feedback_lesion_logits" in generated:
+                row.update(
+                    {
+                        f"feedback_{key}": value
+                        for key, value in dice_scores(
+                            generated["feedback_lesion_logits"],
+                            batch["target_regions"],
+                            region_names=BRATS_REGIONS,
+                        ).items()
+                    }
+                )
+            for index, region in enumerate(BRATS_REGIONS):
+                mask = batch["target_regions"][:, index : index + 1] > 0.5
+                row[f"mae_{region}"] = (
+                    float(error[mask].mean().cpu().item()) if mask.any() else float("nan")
+                )
+                if "closed_loop_reference_synthetic" in generated:
+                    row[f"closed_loop_reference_mae_{region}"] = (
+                        float(reference_error[mask].mean().cpu().item()) if mask.any() else float("nan")
+                    )
+                    row[f"closed_loop_mae_{region}_delta"] = (
+                        row[f"mae_{region}"] - row[f"closed_loop_reference_mae_{region}"]
+                    )
+                    row[f"closed_loop_harm_rate_{region}"] = (
+                        float((error[mask] > reference_error[mask] + 1e-4).float().mean().cpu().item())
+                        if mask.any() else float("nan")
+                    )
+                if "stage1_synthetic" in generated:
+                    row[f"stage1_mae_{region}"] = (
+                        float(stage1_error[mask].mean().cpu().item()) if mask.any() else float("nan")
+                    )
+                    row[f"mae_{region}_delta_from_stage1"] = (
+                        row[f"mae_{region}"] - row[f"stage1_mae_{region}"]
+                        if mask.any()
+                        else float("nan")
+                    )
+                row[f"ssim_{region}"] = (
+                    float(ssim_map[mask].mean().cpu().item()) if mask.any() else float("nan")
+                )
+                row[f"edge_mae_{region}"] = (
+                    float(edge_error[mask].mean().cpu().item()) if mask.any() else float("nan")
+                )
+                row[f"laplacian_mae_{region}"] = (
+                    float(laplacian_error[mask].mean().cpu().item()) if mask.any() else float("nan")
+                )
+            rows.append(row)
     keys = list(rows[0]) if rows else []
     return {
         key: float(np.mean([row[key] for row in rows if math.isfinite(row[key])]))
@@ -3705,7 +3754,7 @@ def selection_score(
 ) -> float:
     if mode == "mae":
         return eval_metric(metrics, "mae")
-    if mode not in {"lesion_composite", "lesion_noharm_composite"}:
+    if mode not in {"lesion_composite", "lesion_noharm_composite", "closed_loop_noharm_composite"}:
         raise ValueError(f"Unknown best metric: {mode}")
     mae = eval_metric(metrics, "mae")
     if not math.isfinite(mae):
@@ -3741,6 +3790,13 @@ def selection_score(
         + float(selection_weights.get("ssim", 0.04)) * ssim_penalty
         + 0.04 * float(lesion_ssim_penalty)
     )
+    if mode == "closed_loop_noharm_composite":
+        if "closed_loop_reference_mae" not in metrics:
+            raise ValueError("Closed-loop checkpoint selection requires reference metrics")
+        score += 0.40 * max(0.0, eval_metric(metrics, "closed_loop_mae_delta_from_reference", 0.0))
+        for region, weight in (("ET", 0.18), ("TC", 0.12), ("WT", 0.08)):
+            score += weight * max(0.0, eval_metric(metrics, f"closed_loop_mae_{region}_delta", 0.0))
+        score += 0.08 * eval_metric(metrics, "closed_loop_harm_rate", 0.0)
     if mode == "lesion_noharm_composite":
         stage1_mae = eval_metric(metrics, "stage1_mae", mae)
         whole_regression = max(0.0, mae - stage1_mae)
@@ -4385,6 +4441,14 @@ def optimizer_to_device(optimizer: torch.optim.Optimizer, device: str) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.closed_loop_token_drift and args.model_kind != "transport":
+        raise ValueError("Closed-loop token drift requires --model-kind transport")
+    if args.best_metric == "closed_loop_noharm_composite" and not args.closed_loop_token_drift:
+        raise ValueError("Closed-loop selection requires --closed-loop-token-drift")
+    if args.closed_loop_detach_feedback:
+        raise ValueError("Detached feedback has no direct training objective; leave this option disabled")
+    if args.freeze_base_generator and args.closed_loop_token_drift and not args.resume_checkpoint:
+        raise ValueError("Freezing the closed-loop base requires a trained --resume-checkpoint")
     if args.cpu_threads < 1:
         raise ValueError("--cpu-threads must be positive")
     torch.set_num_threads(args.cpu_threads)
@@ -4488,6 +4552,14 @@ def main() -> int:
             checkpoint_state,
         )
         missing, unexpected = model.load_state_dict(checkpoint_state, strict=False)
+        if args.freeze_base_generator and args.closed_loop_token_drift:
+            allowed_new = closed_loop_trainable_prefixes() + ("refinement_",)
+            problem_keys = [*missing, *(item["key"] for item in shape_mismatch),
+                            *(item["key"] for item in partial_shape_loads)]
+            invalid_base = [key for key in problem_keys
+                            if not key.startswith(allowed_new)]
+            if invalid_base:
+                raise ValueError(f"Cannot freeze an incompletely loaded base: {invalid_base}")
         model_resume_exact = not (
             missing or unexpected or shape_mismatch or partial_shape_loads
         )
@@ -4628,6 +4700,7 @@ def main() -> int:
                 {
                     "event": "warm_start",
                     "reason": "checkpoint is partial, lacks optimizer state, or is not a resumable step/epoch checkpoint",
+                    "config_mismatches": resume_config_mismatches,
                 }
             ),
             flush=True,
@@ -4684,7 +4757,7 @@ def main() -> int:
             checkpoint_state=checkpoint_state,
         )
         start_step = 0
-        eval_report = evaluate(model, val_loader, args.device)
+        eval_report = evaluate(model, val_loader, args.device, args.evaluation_version)
         eval_score = selection_score(eval_report, effective_best_metric, args.target_modality)
         eval_report = dict(eval_report)
         eval_report["selection_score"] = float(eval_score)
@@ -4753,6 +4826,11 @@ def main() -> int:
             "val_slice_crop_size": val_slice_crop_size,
             "val_slice_crop_mode": val_slice_crop_mode,
             "effective_best_metric": effective_best_metric,
+            "validation_aggregation": "per_slice" if args.evaluation_version == 2 else "legacy_per_batch",
+            "closed_loop_reference": (
+                "frozen_base_without_adapter" if args.freeze_base_generator
+                else "current_trainable_base_without_adapter"
+            ) if args.closed_loop_token_drift else None,
         },
         "resume": resume_report,
         "optimizer_resume": optimizer_resume_report,

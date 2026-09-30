@@ -11,6 +11,7 @@ def multilabel_dice_loss(
     target: torch.Tensor,
     smooth: float = 1.0,
     region_weights: torch.Tensor | None = None,
+    legacy_batch_sum: bool = False,
 ) -> torch.Tensor:
     probs = torch.sigmoid(logits)
     dims = tuple(range(2, probs.ndim))
@@ -21,7 +22,8 @@ def multilabel_dice_loss(
     if region_weights is not None:
         weights = region_weights.to(device=logits.device, dtype=logits.dtype)
         weights = weights.view(1, -1)
-        return (loss * weights).sum() / weights.sum().clamp_min(1e-8)
+        result = (loss * weights).sum() / weights.sum().clamp_min(1e-8)
+        return result if legacy_batch_sum else result / logits.shape[0]
     return loss.mean()
 
 
@@ -52,6 +54,7 @@ def tversky_loss(
     beta: float = 0.7,
     smooth: float = 1.0,
     region_weights: torch.Tensor | None = None,
+    legacy_batch_sum: bool = False,
 ) -> torch.Tensor:
     probs = torch.sigmoid(logits)
     dims = tuple(range(2, probs.ndim))
@@ -63,7 +66,8 @@ def tversky_loss(
     if region_weights is not None:
         weights = region_weights.to(device=logits.device, dtype=logits.dtype)
         weights = weights.view(1, -1)
-        return (loss * weights).sum() / weights.sum().clamp_min(1e-8)
+        result = (loss * weights).sum() / weights.sum().clamp_min(1e-8)
+        return result if legacy_batch_sum else result / logits.shape[0]
     return loss.mean()
 
 
@@ -71,6 +75,7 @@ def segmentation_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
     region_weights: Sequence[float] | torch.Tensor | None = (2.0, 1.5, 1.0),
+    legacy_batch_sum: bool = False,
 ) -> torch.Tensor:
     weights = None
     if region_weights is not None:
@@ -80,9 +85,9 @@ def segmentation_loss(
             else torch.tensor(region_weights, dtype=logits.dtype, device=logits.device)
         )
     return (
-        multilabel_dice_loss(logits, target, region_weights=weights)
+        multilabel_dice_loss(logits, target, region_weights=weights, legacy_batch_sum=legacy_batch_sum)
         + focal_bce_loss(logits, target, region_weights=weights)
-        + 0.5 * tversky_loss(logits, target, region_weights=weights)
+        + 0.5 * tversky_loss(logits, target, region_weights=weights, legacy_batch_sum=legacy_batch_sum)
     )
 
 
